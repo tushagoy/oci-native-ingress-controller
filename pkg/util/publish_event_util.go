@@ -30,12 +30,6 @@ const (
 	IngressBackendValidationAction = "IngressBackendValidation"
 )
 
-const (
-	UnsupportedBackendReason       = "UnsupportedBackend"
-	MissingServiceBackendReason    = "MissingServiceBackend"
-	IngressBackendValidationAction = "IngressBackendValidation"
-)
-
 func PublishWarningEventForIngress(eventRecorder events.EventRecorder, ingressLister networkinglisters.IngressLister,
 	ingressKey interface{}, inputErr error, reason string, action string) {
 	ingress, err := GetIngressFromMetaNamespaceKey(ingressKey, ingressLister)
