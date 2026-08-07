@@ -12,11 +12,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
+	"reflect"
+	"strings"
+	"time"
+
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/events"
-	"reflect"
-	"time"
 
 	"github.com/oracle/oci-native-ingress-controller/pkg/client"
 	"k8s.io/klog/v2"
@@ -39,6 +42,7 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/common"
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"github.com/oracle/oci-native-ingress-controller/api/v1beta1"
+	ociclient "github.com/oracle/oci-native-ingress-controller/pkg/oci/client"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 )
 
@@ -321,8 +325,20 @@ func (c *Controller) createLoadBalancer(ctx context.Context, ic *networkingv1.In
 		DefinedTags:  definedTags,
 	}
 
+	reservedIps := make([]ociloadbalancer.ReservedIp, 0, 2)
 	if icp.Spec.ReservedPublicAddressId != "" {
-		createDetails.ReservedIps = []ociloadbalancer.ReservedIp{{Id: common.String(icp.Spec.ReservedPublicAddressId)}}
+		reservedIps = append(reservedIps, ociloadbalancer.ReservedIp{Id: common.String(icp.Spec.ReservedPublicAddressId)})
+	}
+
+	reservedPrivateIpId, err := c.getValidatedReservedPrivateIpAddressId(ctx, ic, icp.Spec.IsPrivate)
+	if err != nil {
+		return nil, err
+	}
+	if reservedPrivateIpId != "" {
+		reservedIps = append(reservedIps, ociloadbalancer.ReservedIp{Id: common.String(reservedPrivateIpId)})
+	}
+	if len(reservedIps) > 0 {
+		createDetails.ReservedIps = reservedIps
 	}
 
 	createDetails.ShapeDetails = &ociloadbalancer.ShapeDetails{
@@ -337,7 +353,7 @@ func (c *Controller) createLoadBalancer(ctx context.Context, ic *networkingv1.In
 		OpcRetryToken:             common.String(fmt.Sprintf("create-lb-%s", ic.UID)),
 		CreateLoadBalancerDetails: createDetails,
 	}
-	klog.Infof("Create lb request: %s", util.PrettyPrint(createLbRequest))
+	klog.V(4).InfoS("Prepared load balancer create request", "ingressClass", klog.KObj(ic), "reservedIpCount", len(createDetails.ReservedIps))
 
 	wrapperClient, ok := ctx.Value(util.WrapperClient).(*client.WrapperClient)
 	if !ok {
@@ -381,6 +397,21 @@ func (c *Controller) checkForIngressClassParameterUpdates(ctx context.Context, i
 	lb, etag, err := c.getLoadBalancer(ctx, ic)
 	if err != nil {
 		return err
+	}
+
+	desiredReservedPrivateIpId, err := util.GetIngressClassReservedPrivateIpAddressId(ic)
+	if err != nil {
+		return err
+	}
+	if err := validateReservedPrivateIPSupport(desiredReservedPrivateIpId, icp.Spec.IsPrivate); err != nil {
+		return err
+	}
+	actualReservedPublicAddressId, actualReservedPrivateIpId := getLoadBalancerReservedIpIds(lb)
+	if strings.TrimSpace(icp.Spec.ReservedPublicAddressId) != actualReservedPublicAddressId {
+		return fmt.Errorf("reserved public IP setting is immutable after load balancer creation")
+	}
+	if desiredReservedPrivateIpId != actualReservedPrivateIpId {
+		return fmt.Errorf("reserved private IP setting is immutable after load balancer creation")
 	}
 
 	wrapperClient, ok := ctx.Value(util.WrapperClient).(*client.WrapperClient)
@@ -450,6 +481,97 @@ func (c *Controller) checkForIngressClassParameterUpdates(ctx context.Context, i
 
 	}
 	return nil
+}
+
+func (c *Controller) getValidatedReservedPrivateIpAddressId(ctx context.Context, ic *networkingv1.IngressClass, isPrivate bool) (string, error) {
+	reservedPrivateIpId, err := util.GetIngressClassReservedPrivateIpAddressId(ic)
+	if err != nil {
+		return "", err
+	}
+	if err := validateReservedPrivateIPSupport(reservedPrivateIpId, isPrivate); err != nil {
+		return "", err
+	}
+	if reservedPrivateIpId == "" {
+		return "", nil
+	}
+
+	resourceType, err := util.GetOcidResourceType(reservedPrivateIpId)
+	if err != nil {
+		return "", fmt.Errorf("reserved private IP annotation must be a valid OCI OCID: %w", err)
+	}
+	if resourceType == util.OcidResourceTypeIPv6 {
+		return "", fmt.Errorf("reserved private IPv6 is not supported")
+	}
+	if resourceType != util.OcidResourceTypePrivateIP {
+		return "", fmt.Errorf("reserved private IP annotation must reference a private IP OCID")
+	}
+
+	wrapperClient, ok := ctx.Value(util.WrapperClient).(*client.WrapperClient)
+	if !ok {
+		return "", fmt.Errorf(util.OciClientNotFoundInContextError)
+	}
+	if wrapperClient.GetPrivateIpClient() == nil {
+		return "", fmt.Errorf("private IP client not configured")
+	}
+
+	privateIPAddress, err := wrapperClient.GetPrivateIpClient().GetPrivateIp(ctx, ociclient.GetPrivateIpRequest{
+		PrivateIpId: common.String(reservedPrivateIpId),
+	})
+	if err != nil {
+		return "", fmt.Errorf("unable to validate reserved private IP: %w", err)
+	}
+	if privateIPAddress.Lifetime != ociclient.PrivateIPLifetimeReserved {
+		return "", fmt.Errorf("reserved private IP annotation must reference a reserved private IP")
+	}
+	if privateIPAddress.IpAddress == nil {
+		return "", fmt.Errorf("reserved private IP lookup returned no IP address")
+	}
+
+	parsedIP := net.ParseIP(*privateIPAddress.IpAddress)
+	if parsedIP == nil {
+		return "", fmt.Errorf("reserved private IP lookup returned an invalid IP address")
+	}
+	if parsedIP.To4() == nil {
+		return "", fmt.Errorf("reserved private IPv6 is not supported")
+	}
+
+	return reservedPrivateIpId, nil
+}
+
+func validateReservedPrivateIPSupport(reservedPrivateIpId string, isPrivate bool) error {
+	if reservedPrivateIpId != "" && !isPrivate {
+		return fmt.Errorf("reserved private IP is only supported for private load balancers")
+	}
+
+	return nil
+}
+
+func getLoadBalancerReservedIpIds(lb *ociloadbalancer.LoadBalancer) (string, string) {
+	if lb == nil {
+		return "", ""
+	}
+
+	var reservedPublicAddressId string
+	var reservedPrivateIpId string
+	for _, ipAddress := range lb.IpAddresses {
+		if ipAddress.ReservedIp == nil || ipAddress.ReservedIp.Id == nil {
+			continue
+		}
+
+		id := strings.TrimSpace(*ipAddress.ReservedIp.Id)
+		if id == "" {
+			continue
+		}
+
+		if ipAddress.IsPublic != nil && *ipAddress.IsPublic {
+			reservedPublicAddressId = id
+			continue
+		}
+
+		reservedPrivateIpId = id
+	}
+
+	return reservedPublicAddressId, reservedPrivateIpId
 }
 
 func (c *Controller) checkForNetworkSecurityGroupsUpdate(ctx context.Context, ic *networkingv1.IngressClass) error {

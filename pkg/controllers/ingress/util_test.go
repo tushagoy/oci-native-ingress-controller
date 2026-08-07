@@ -208,7 +208,7 @@ func initsUtil(secretList *corev1.SecretList) (*client.ClientProvider, ociloadba
 		RuleSets:                nil,
 		RoutingPolicies:         nil,
 	}
-	wrapperClient := client.NewWrapperClient(k8client, nil, nil, certificatesClient, nil)
+	wrapperClient := client.NewWrapperClient(k8client, nil, nil, nil, certificatesClient, nil)
 	mockClient := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},

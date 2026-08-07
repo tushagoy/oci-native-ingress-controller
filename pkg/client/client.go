@@ -72,6 +72,7 @@ type WrapperClient struct {
 	kubernetesClient      kubernetes.Interface
 	wafClient             *waf.Client
 	lbClient              *loadbalancer.LoadBalancerClient
+	privateIpClient       ociclient.PrivateIpInterface
 	certificatesClient    *certificate.CertificatesClient
 	containerEngineClient *containerengine.ContainerEngineClient
 }
@@ -115,6 +116,11 @@ func newWrapperClientFromConfig(configGetter auth.ConfigGetter, k8sClient kubern
 	// Retry transient OCI Certificates throttling (HTTP 429) at the SDK client layer.
 	configureCertificatesClientsRetryPolicy(&ociCertificatesClient, &ociCertificatesMgmtClient)
 
+	privateIPClient, err := ociclient.NewPrivateIpClient(configProvider)
+	if err != nil {
+		return nil, err
+	}
+
 	ociWafClient, err := ociwaf.NewWafClientWithConfigurationProvider(configProvider)
 	if err != nil {
 		return nil, err
@@ -130,13 +136,21 @@ func newWrapperClientFromConfig(configGetter auth.ConfigGetter, k8sClient kubern
 		kubernetesClient:      k8sClient,
 		wafClient:             waf.New(&ociWafClient),
 		lbClient:              loadbalancer.New(&ociLBClient),
+		privateIpClient:       privateIPClient,
 		certificatesClient:    certificate.New(&ociCertificatesMgmtClient, ociclient.NewCertificateClient(&ociCertificatesClient)),
 		containerEngineClient: &containerEngineClient,
 	}, nil
 }
 
-func NewWrapperClient(kubernetesClient kubernetes.Interface, wafClient *waf.Client, lbClient *loadbalancer.LoadBalancerClient, certificatesClient *certificate.CertificatesClient, containerEngineClient *containerengine.ContainerEngineClient) *WrapperClient {
-	return &WrapperClient{kubernetesClient: kubernetesClient, wafClient: wafClient, lbClient: lbClient, certificatesClient: certificatesClient, containerEngineClient: containerEngineClient}
+func NewWrapperClient(kubernetesClient kubernetes.Interface, wafClient *waf.Client, lbClient *loadbalancer.LoadBalancerClient, privateIpClient ociclient.PrivateIpInterface, certificatesClient *certificate.CertificatesClient, containerEngineClient *containerengine.ContainerEngineClient) *WrapperClient {
+	return &WrapperClient{
+		kubernetesClient:      kubernetesClient,
+		wafClient:             wafClient,
+		lbClient:              lbClient,
+		privateIpClient:       privateIpClient,
+		certificatesClient:    certificatesClient,
+		containerEngineClient: containerEngineClient,
+	}
 }
 
 func (c *WrapperClient) GetK8Client() kubernetes.Interface {
@@ -149,6 +163,10 @@ func (c *WrapperClient) GetWafClient() *waf.Client {
 
 func (c *WrapperClient) GetLbClient() *loadbalancer.LoadBalancerClient {
 	return c.lbClient
+}
+
+func (c *WrapperClient) GetPrivateIpClient() ociclient.PrivateIpInterface {
+	return c.privateIpClient
 }
 
 func (c *WrapperClient) GetCertClient() *certificate.CertificatesClient {

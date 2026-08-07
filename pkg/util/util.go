@@ -76,6 +76,9 @@ const (
 	IngressClassDefinedTagsAnnotation             = "oci-native-ingress.oraclecloud.com/defined-tags"
 	IngressClassFreeformTagsAnnotation            = "oci-native-ingress.oraclecloud.com/freeform-tags"
 	IngressClassImplicitDefaultTagsAnnotation     = "oci-native-ingress.oraclecloud.com/implicit-default-tags"
+	IngressClassReservedPrivateIpAnnotation       = "oci-native-ingress.oraclecloud.com/reserved-private-ip-address-id"
+	OcidResourceTypePrivateIP                     = "privateip"
+	OcidResourceTypeIPv6                          = "ipv6"
 
 	IngressHealthCheckProtocolAnnotation             = "oci-native-ingress.oraclecloud.com/healthcheck-protocol"
 	IngressHealthCheckPortAnnotation                 = "oci-native-ingress.oraclecloud.com/healthcheck-port"
@@ -190,6 +193,38 @@ func GetIngressClassFireWallId(ic *networkingv1.IngressClass) string {
 	}
 
 	return value
+}
+
+func GetIngressClassReservedPrivateIpAddressId(ic *networkingv1.IngressClass) (string, error) {
+	annotation := IngressClassReservedPrivateIpAnnotation
+	value, ok := ic.Annotations[annotation]
+	if !ok {
+		return "", nil
+	}
+
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("ingress class annotation %s must not be empty", annotation)
+	}
+
+	return trimmed, nil
+}
+
+// GetOcidResourceType returns the resource type segment from an OCI OCID.
+// It returns an error when the OCID is empty or does not match the expected
+// ocid1.<resourceType>.<realm>... format.
+func GetOcidResourceType(ocid string) (string, error) {
+	trimmed := strings.TrimSpace(ocid)
+	if trimmed == "" {
+		return "", fmt.Errorf("OCID must not be empty")
+	}
+
+	parts := strings.Split(trimmed, ".")
+	if len(parts) < 4 || parts[0] != "ocid1" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("invalid OCID format")
+	}
+
+	return parts[1], nil
 }
 
 func GetIngressClassNetworkSecurityGroupIds(ic *networkingv1.IngressClass) []string {

@@ -183,6 +183,56 @@ func TestGetIngressClassNetworkSecurityGroupIds(t *testing.T) {
 		Should(Equal([]string{"id1", "id2", "id3", "id4"}))
 }
 
+func TestGetIngressClassReservedPrivateIpAddressId(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressClassWithNoAnnotation := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+	}
+	ingressClassWithReservedPrivateIP := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressClassReservedPrivateIpAnnotation: "  ocid1.privateip.oc1.iad.example  "},
+		},
+	}
+	ingressClassWithEmptyReservedPrivateIP := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressClassReservedPrivateIpAnnotation: "   "},
+		},
+	}
+
+	value, err := GetIngressClassReservedPrivateIpAddressId(ingressClassWithNoAnnotation)
+	Expect(err).Should(BeNil())
+	Expect(value).Should(BeEmpty())
+
+	value, err = GetIngressClassReservedPrivateIpAddressId(ingressClassWithReservedPrivateIP)
+	Expect(err).Should(BeNil())
+	Expect(value).Should(Equal("ocid1.privateip.oc1.iad.example"))
+
+	_, err = GetIngressClassReservedPrivateIpAddressId(ingressClassWithEmptyReservedPrivateIP)
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("must not be empty"))
+}
+
+func TestGetOcidResourceType(t *testing.T) {
+	RegisterTestingT(t)
+
+	resourceType, err := GetOcidResourceType(" ocid1.privateip.oc1.iad.example ")
+	Expect(err).Should(BeNil())
+	Expect(resourceType).Should(Equal("privateip"))
+
+	resourceType, err = GetOcidResourceType("ocid1.ipv6.oc1.iad.example")
+	Expect(err).Should(BeNil())
+	Expect(resourceType).Should(Equal("ipv6"))
+
+	_, err = GetOcidResourceType("  ")
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("must not be empty"))
+
+	_, err = GetOcidResourceType("invalid")
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("invalid OCID format"))
+}
+
 func TestGetIngressClassDeleteProtectionEnabled(t *testing.T) {
 	RegisterTestingT(t)
 

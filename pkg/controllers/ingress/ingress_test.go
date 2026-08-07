@@ -102,7 +102,7 @@ func inits(ctx context.Context, ingressClassList *networkingv1.IngressClassList,
 	}
 
 	ingressClassInformer, ingressInformer, saInformer, serviceLister, secretInformer, k8client := setUp(ctx, ingressClassList, ingressList, testService)
-	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, certificatesClient, nil)
+	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, certificatesClient, nil)
 	fakeClient := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},
@@ -142,7 +142,7 @@ func initsWithCustomLBAndServicesAndSecrets(ctx context.Context, ingressClassLis
 	}
 
 	ingressClassInformer, ingressInformer, saInformer, serviceLister, secretInformer, k8client := setUpWithSecrets(ctx, ingressClassList, ingressList, testService, secretList)
-	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, certificatesClient, nil)
+	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, certificatesClient, nil)
 	fakeClient := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},
