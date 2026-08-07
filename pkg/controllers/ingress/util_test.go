@@ -472,8 +472,8 @@ func TestBackendSetSslConfigNeedsUpdate(t *testing.T) {
 	presentBackendSetWithPolicy := &ociloadbalancer.BackendSet{
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
 			TrustedCertificateAuthorityIds: caBundleId1,
-			CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
-			Protocols:                      DefaultMultiCertTLSPolicy.BackendSet.Protocols,
+			CipherSuiteName:                common.String(LockedDefaultTLSPolicy.BackendSet.CipherSuiteName),
+			Protocols:                      LockedDefaultTLSPolicy.BackendSet.Protocols,
 		},
 	}
 	calculatedConfig1 := &ociloadbalancer.SslConfigurationDetails{
@@ -481,8 +481,8 @@ func TestBackendSetSslConfigNeedsUpdate(t *testing.T) {
 	}
 	calculatedConfigWithPolicy := &ociloadbalancer.SslConfigurationDetails{
 		TrustedCertificateAuthorityIds: caBundleId1,
-		CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
-		Protocols:                      DefaultMultiCertTLSPolicy.BackendSet.Protocols,
+		CipherSuiteName:                common.String(LockedDefaultTLSPolicy.BackendSet.CipherSuiteName),
+		Protocols:                      LockedDefaultTLSPolicy.BackendSet.Protocols,
 	}
 
 	Expect(backendSetSslConfigNeedsUpdate(nil, backendSetWithNilSslConfig, false)).To(BeFalse())
@@ -497,13 +497,13 @@ func TestBackendSetSslConfigNeedsUpdate(t *testing.T) {
 	presentBackendSetWithReorderedProtocols := &ociloadbalancer.BackendSet{
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
 			TrustedCertificateAuthorityIds: caBundleId1,
-			CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+			CipherSuiteName:                common.String(LockedDefaultTLSPolicy.BackendSet.CipherSuiteName),
 			Protocols:                      []string{"TLSv1.3", "TLSv1.2"},
 		},
 	}
 	calculatedConfigWithReorderedProtocols := &ociloadbalancer.SslConfigurationDetails{
 		TrustedCertificateAuthorityIds: caBundleId1,
-		CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+		CipherSuiteName:                common.String(LockedDefaultTLSPolicy.BackendSet.CipherSuiteName),
 		Protocols:                      []string{"TLSv1.2", "TLSv1.3"},
 	}
 	Expect(backendSetSslConfigNeedsUpdate(calculatedConfigWithReorderedProtocols, presentBackendSetWithReorderedProtocols, true)).To(BeFalse())

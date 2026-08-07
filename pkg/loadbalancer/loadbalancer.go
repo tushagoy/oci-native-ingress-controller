@@ -17,17 +17,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
-
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
+	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
 	"github.com/oracle/oci-native-ingress-controller/pkg/oci/client"
+	"github.com/oracle/oci-native-ingress-controller/pkg/tlspolicy"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 )
-
-const ociCustomizedCipherSuiteName = "oci-customized-ssl-cipher-suite"
 
 type LbCacheObj struct {
 	LB   *loadbalancer.LoadBalancer
@@ -724,7 +722,7 @@ func listenerSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfigu
 	if current == nil {
 		return nil, nil
 	}
-	if err := ensureRequestableCipherSuite("listener", current.CipherSuiteName); err != nil {
+	if err := tlspolicy.EnsureRequestableCipherSuite("listener", current.CipherSuiteName); err != nil {
 		return nil, err
 	}
 	return &loadbalancer.SslConfigurationDetails{
@@ -738,7 +736,7 @@ func backendSetSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfi
 	if current == nil {
 		return nil, nil
 	}
-	if err := ensureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+	if err := tlspolicy.EnsureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
 		return nil, err
 	}
 	return &loadbalancer.SslConfigurationDetails{
@@ -754,7 +752,7 @@ func backendSetSslConfigurationDetailsWithPreservedPolicy(desired *loadbalancer.
 		return desired, nil
 	}
 	if desired.CipherSuiteName == nil && current.CipherSuiteName != nil {
-		if err := ensureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+		if err := tlspolicy.EnsureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
 			return nil, err
 		}
 		desired.CipherSuiteName = current.CipherSuiteName
@@ -763,13 +761,6 @@ func backendSetSslConfigurationDetailsWithPreservedPolicy(desired *loadbalancer.
 		desired.Protocols = current.Protocols
 	}
 	return desired, nil
-}
-
-func ensureRequestableCipherSuite(resourceKind string, cipherSuiteName *string) error {
-	if cipherSuiteName != nil && *cipherSuiteName == ociCustomizedCipherSuiteName {
-		return fmt.Errorf("TLSPolicyPreserveFailed: cannot preserve non-requestable %s cipherSuiteName %q", resourceKind, *cipherSuiteName)
-	}
-	return nil
 }
 
 func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
@@ -810,11 +801,6 @@ func (lbc *LoadBalancerClient) updateListener(ctx context.Context, lbId *string,
 
 	if defaultBackendSet == nil || *defaultBackendSet == "" {
 		defaultBackendSet = l.DefaultBackendSetName
-	}
-
-	// This is the HTTP/2-family fallback for callers that did not already select an explicit policy.
-	if sslConfigurationDetails != nil && util.IsListenerProtocolUsingHTTP2CipherSuite(*protocol) && sslConfigurationDetails.CipherSuiteName == nil {
-		sslConfigurationDetails.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
 	updateListenerRequest := loadbalancer.UpdateListenerRequest{
@@ -881,14 +867,9 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 		return nil
 	}
 
-	// This is the HTTP/2-family fallback for callers that did not already select an explicit policy.
 	if util.IsListenerProtocolTLSRequired(listenerProtocol) {
 		if sslConfig == nil {
 			return fmt.Errorf("no TLS configuration provided for a %s listener at port %d", listenerProtocol, listenerPort)
-		}
-
-		if sslConfig.CipherSuiteName == nil {
-			sslConfig.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 		}
 	}
 

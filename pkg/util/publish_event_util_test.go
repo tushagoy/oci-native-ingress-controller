@@ -97,6 +97,23 @@ func TestPublishWarningEvent(t *testing.T) {
 	Eventually(fakeRecorder.Events).Should(Receive())
 }
 
+func TestPublishWarningEventUsesCallerSuppliedReason(t *testing.T) {
+	RegisterTestingT(t)
+
+	fakeRecorder := events.NewFakeRecorder(10)
+	ingress := &networkingv1.Ingress{}
+	err := errors.New("TLSPolicyInvalidAnnotation: listener 443 ingress default/ing: oci-native-ingress.oraclecloud.com/listener-ssl-config.protocols: deprecated protocol \"TLSv1.1\" is not supported")
+	reason := "TLSPolicyInvalidAnnotation"
+
+	PublishWarningEvent(fakeRecorder, ingress, err, reason, "IngressReconcile")
+
+	Eventually(fakeRecorder.Events).Should(Receive(And(
+		ContainSubstring(reason),
+		ContainSubstring("listener 443"),
+		ContainSubstring(IngressListenerSslConfigAnnotation),
+	)))
+}
+
 func TestPublishIngressBackendValidationEvents(t *testing.T) {
 	RegisterTestingT(t)
 

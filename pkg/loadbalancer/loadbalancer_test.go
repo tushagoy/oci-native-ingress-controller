@@ -167,7 +167,7 @@ func TestLoadBalancerClient_CreateGRPCListenerRequiresTLS(t *testing.T) {
 	Expect(capturedCreateListenerRequest).To(BeNil())
 }
 
-func TestLoadBalancerClient_CreateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *testing.T) {
+func TestLoadBalancerClient_CreateGRPCListenerDoesNotSynthesizeTLSPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
 	capturedCreateListenerRequest = nil
@@ -177,7 +177,8 @@ func TestLoadBalancerClient_CreateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *
 	Expect(err).To(BeNil())
 	Expect(capturedCreateListenerRequest).ToNot(BeNil())
 	Expect(*capturedCreateListenerRequest.Protocol).To(Equal(util.ProtocolGRPC))
-	Expect(*capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal(util.ProtocolHTTP2DefaultCipherSuite))
+	Expect(capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(BeNil())
+	Expect(capturedCreateListenerRequest.SslConfiguration.Protocols).To(BeNil())
 }
 
 func TestLoadBalancerClient_CreateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
@@ -307,7 +308,7 @@ func TestLoadBalancerClient_UpdateBackendSetDetails(t *testing.T) {
 	Expect(err).To(BeNil())
 }
 
-func TestLoadBalancerClient_UpdateBackendSetDetails_PreservesBackendSetTLSPolicy(t *testing.T) {
+func TestLoadBalancerClient_UpdateBackendSetDetailsRejectsCustomizedCipherSuitePreserve(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
 	capturedUpdateBackendSetRequest = nil
@@ -321,20 +322,17 @@ func TestLoadBalancerClient_UpdateBackendSetDetails_PreservesBackendSetTLSPolicy
 	bs := lb.BackendSets[bsName]
 	bs.SslConfiguration = &ociloadbalancer.SslConfiguration{
 		TrustedCertificateAuthorityIds: []string{"ca-current"},
-		CipherSuiteName:                common.String("existing-backend-cipher"),
-		Protocols:                      []string{"TLSv1.2"},
+		CipherSuiteName:                common.String("oci-customized-ssl-cipher-suite"),
+		Protocols:                      []string{"TLSv1.1"},
 	}
 	sslConfigDetails := ociloadbalancer.SslConfigurationDetails{TrustedCertificateAuthorityIds: []string{"ca-desired"}}
 	healthCheckerDetails := ociloadbalancer.HealthCheckerDetails{}
 
 	err := loadBalancerClient.UpdateBackendSetDetails(context.TODO(), lbId, etag, &bs, &sslConfigDetails,
 		&healthCheckerDetails, policy, nil, nil)
-	Expect(err).To(BeNil())
-	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
-	sslConfig := capturedUpdateBackendSetRequest.SslConfiguration
-	Expect(sslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-desired"}))
-	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-backend-cipher"))
-	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("TLSPolicyPreserveFailed"))
+	Expect(capturedUpdateBackendSetRequest).To(BeNil())
 }
 
 func TestLoadBalancerClient_UpdateBackendSetDetails_AllowsIntentionalBackendTLSDisable(t *testing.T) {
@@ -363,15 +361,15 @@ func TestLoadBalancerClient_UpdateBackendSetDetails_AllowsIntentionalBackendTLSD
 	Expect(capturedUpdateBackendSetRequest.SslConfiguration).To(BeNil())
 }
 
-func TestBackendSetSslConfigurationDetailsFromCurrentUsesAllowlist(t *testing.T) {
+func TestBackendSetSslConfigurationDetailsFromCurrentPreservesRequestableExistingPolicy(t *testing.T) {
 	RegisterTestingT(t)
 
 	current := &ociloadbalancer.SslConfiguration{
 		TrustedCertificateAuthorityIds: []string{"ca-a"},
 		CertificateIds:                 []string{"listener-cert"},
 		CertificateName:                common.String("legacy-cert-name"),
-		CipherSuiteName:                common.String("existing-cipher"),
-		Protocols:                      []string{"TLSv1.2"},
+		CipherSuiteName:                common.String("existing-backend-cipher"),
+		Protocols:                      []string{"TLSv1.1"},
 	}
 
 	sslConfig, err := backendSetSslConfigurationDetailsFromCurrent(current)
@@ -380,8 +378,24 @@ func TestBackendSetSslConfigurationDetailsFromCurrentUsesAllowlist(t *testing.T)
 	Expect(sslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-a"}))
 	Expect(sslConfig.CertificateIds).To(BeNil())
 	Expect(sslConfig.CertificateName).To(BeNil())
-	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-cipher"))
-	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-backend-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.1"}))
+}
+
+func TestBackendSetSslConfigurationDetailsFromCurrentRejectsCustomizedCipherSuitePreserve(t *testing.T) {
+	RegisterTestingT(t)
+
+	current := &ociloadbalancer.SslConfiguration{
+		TrustedCertificateAuthorityIds: []string{"ca-a"},
+		CipherSuiteName:                common.String("oci-customized-ssl-cipher-suite"),
+		Protocols:                      []string{"TLSv1.1"},
+	}
+
+	sslConfig, err := backendSetSslConfigurationDetailsFromCurrent(current)
+
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("TLSPolicyPreserveFailed"))
+	Expect(sslConfig).To(BeNil())
 }
 
 func TestLoadBalancerClient_DeleteBackendSet(t *testing.T) {
@@ -725,9 +739,10 @@ func TestLoadBalancerClient_UpdateListenerDetachRoutingPolicy_PreservesListenerS
 	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
-func TestLoadBalancerClient_UpdateListenerRejectsNonRequestablePreservedCipherSuite(t *testing.T) {
+func TestLoadBalancerClient_UpdateListenerRejectsCustomizedCipherSuitePreserve(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
 
 	id := "id"
 	pname := "route_80"
@@ -739,8 +754,8 @@ func TestLoadBalancerClient_UpdateListenerRejectsNonRequestablePreservedCipherSu
 		Protocol: &proto,
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
 			CertificateIds:  []string{"cert-a"},
-			CipherSuiteName: common.String(ociCustomizedCipherSuiteName),
-			Protocols:       []string{"TLSv1.2"},
+			CipherSuiteName: common.String("oci-customized-ssl-cipher-suite"),
+			Protocols:       []string{"TLSv1.1"},
 		},
 	}
 
@@ -748,6 +763,7 @@ func TestLoadBalancerClient_UpdateListenerRejectsNonRequestablePreservedCipherSu
 
 	Expect(err).To(HaveOccurred())
 	Expect(err.Error()).To(ContainSubstring("TLSPolicyPreserveFailed"))
+	Expect(capturedUpdateListenerRequest).To(BeNil())
 }
 
 func TestLoadBalancerClient_UpdateListener_PreservesDesiredMultiCertificateIds(t *testing.T) {
@@ -835,7 +851,7 @@ func TestLoadBalancerClient_HTTP2DefaultDoesNotOverrideExplicitTLSPolicy(t *test
 	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
-func TestLoadBalancerClient_UpdateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *testing.T) {
+func TestLoadBalancerClient_UpdateGRPCListenerDoesNotSynthesizeTLSPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
 	capturedUpdateListenerRequest = nil
@@ -854,7 +870,8 @@ func TestLoadBalancerClient_UpdateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *
 	Expect(err).To(BeNil())
 	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
 	Expect(*capturedUpdateListenerRequest.Protocol).To(Equal(util.ProtocolGRPC))
-	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal(util.ProtocolHTTP2DefaultCipherSuite))
+	Expect(capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(BeNil())
+	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(BeNil())
 }
 
 func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {

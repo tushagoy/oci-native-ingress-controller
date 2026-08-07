@@ -63,6 +63,8 @@ const (
 
 	IngressListenerTlsCertificateAnnotation = "oci-native-ingress.oraclecloud.com/certificate-ocid"
 	IngressBackendTlsEnabledAnnotation      = "oci-native-ingress.oraclecloud.com/backend-tls-enabled"
+	IngressListenerSslConfigAnnotation      = "oci-native-ingress.oraclecloud.com/listener-ssl-config"
+	IngressBackendSetSslConfigAnnotation    = "oci-native-ingress.oraclecloud.com/backendset-ssl-config"
 
 	// IngressProtocolAnnotation - HTTP, HTTP2, GRPC, TCP are accepted.
 	IngressProtocolAnnotation = "oci-native-ingress.oraclecloud.com/protocol"
@@ -100,7 +102,7 @@ const (
 	ProtocolHTTP                           = "HTTP"
 	ProtocolHTTP2                          = "HTTP2"
 	ProtocolGRPC                           = "GRPC"
-	ProtocolHTTP2DefaultCipherSuite        = "oci-default-http2-ssl-cipher-suite-v1"
+	ProtocolHTTP2DefaultCipherSuite        = "oci-default-http2-tls-12-13-ssl-cipher-suite-v1"
 	DefaultBackendSetName                  = "default_ingress"
 	DefaultHealthCheckProtocol             = ProtocolTCP
 	DefaultHealthCheckPort                 = 0

@@ -16,6 +16,7 @@ import (
 
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"github.com/oracle/oci-native-ingress-controller/pkg/metric"
+	"github.com/oracle/oci-native-ingress-controller/pkg/tlspolicy"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 	"github.com/pkg/errors"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -38,6 +39,8 @@ const (
 	SessionPersistenceEmptyMessage    = "validation failure: empty session persistence configuration for backend set %s"
 	BackendTlsEnabledConflictMessage  = "validation failure: incompatible backend-tls-enabled config across ingresses sharing backend set %s in the ingress class"
 	BackendTlsArtifactConflictMessage = "validation failure: incompatible backend TLS certificate or secret across ingresses sharing backend set %s in the ingress class"
+	TLSPolicyInvalidAnnotationMessage = "TLSPolicyInvalidAnnotation: %s %s ingress %s: %w"
+	TLSPolicyConflictMessage          = "TLSPolicyConflict: %s %s annotation %s field %s conflicts between ingress %s value %q and ingress %s value %q"
 )
 
 type TlsConfig struct {
@@ -63,6 +66,12 @@ type backendTLSStatus struct {
 	Config              TlsConfig
 }
 
+type tlsPolicyCandidate struct {
+	IngressKey     string
+	AnnotationName string
+	RawValue       string
+}
+
 type StateStore struct {
 	IngressClassLister networkinglisters.IngressClassLister
 	IngressLister      networkinglisters.IngressLister
@@ -77,10 +86,12 @@ type IngressClassState struct {
 	BackendSetHealthCheckerMap      map[string]*ociloadbalancer.HealthCheckerDetails
 	BackendSetPolicyMap             map[string]string
 	BackendSetTLSConfigMap          map[string]TlsConfig
+	BackendSetTLSPolicyMap          map[string]*tlspolicy.ExplicitTLSPolicy
 	BackendSetSessionPersistenceMap map[string]SessionPersistence
 	Listeners                       sets.Int32
 	ListenerProtocolMap             map[int32]string
 	ListenerTLSConfigMap            map[int32]ListenerTLSConfig
+	ListenerTLSPolicyMap            map[int32]*tlspolicy.ExplicitTLSPolicy
 	ListenerDefaultBsMap            map[int32]string
 	// ListenerBackendSetMap includes backend sets reachable through listener defaults,
 	// path rules, and the routing-policy rules derived from those paths.
@@ -136,8 +147,10 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 	klog.Infof("Found %d ingress resources related to ingress class %s", len(ingressGroup), ingressClass.Name)
 	bsTLSConfigMap := make(map[string]TlsConfig)
 	backendTLSStatusMap := make(map[string]backendTLSStatus)
+	bsTLSPolicyCandidateMap := make(map[string][]tlsPolicyCandidate)
 	listenerProtocolMap := make(map[int32]string)
 	listenerTLSCandidateMap := make(map[int32][]listenerTLSCandidate)
+	listenerTLSPolicyCandidateMap := make(map[int32][]tlsPolicyCandidate)
 	listenerDefaultBsMap := make(map[int32]string)
 	listenerBackendSetMap := make(map[int32]sets.String)
 	bsHealthCheckerMap := make(map[string]*ociloadbalancer.HealthCheckerDetails)
@@ -198,6 +211,8 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 				desiredBackendSets.Insert(bsName)
 				allBackendSets.Insert(bsName)
 				appendListenerBackendSet(listenerBackendSetMap, listenerPort, bsName)
+				appendTLSPolicyCandidate(listenerTLSPolicyCandidateMap, listenerPort, ing, util.IngressListenerSslConfigAnnotation)
+				appendTLSPolicyCandidate(bsTLSPolicyCandidateMap, bsName, ing, util.IngressBackendSetSslConfigAnnotation)
 
 				err = validateListenerProtocol(ing, listenerProtocolMap, listenerPort)
 				if err != nil {
@@ -249,15 +264,25 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 		}
 	}
 	listenerTLSConfigMap := buildListenerTLSConfigMap(listenerTLSCandidateMap)
+	listenerTLSPolicyMap, err := buildListenerTLSPolicyMap(listenerTLSPolicyCandidateMap, listenerTLSConfigMap)
+	if err != nil {
+		return err
+	}
+	bsTLSPolicyMap, err := buildBackendSetTLSPolicyMap(bsTLSPolicyCandidateMap, bsTLSConfigMap)
+	if err != nil {
+		return err
+	}
 	s.IngressGroupState = IngressClassState{
 		BackendSets:                     allBackendSets,
 		BackendSetHealthCheckerMap:      bsHealthCheckerMap,
 		BackendSetPolicyMap:             bsPolicyMap,
 		BackendSetTLSConfigMap:          bsTLSConfigMap,
+		BackendSetTLSPolicyMap:          bsTLSPolicyMap,
 		BackendSetSessionPersistenceMap: bsSessionPersistenceMap,
 		Listeners:                       allListeners,
 		ListenerProtocolMap:             listenerProtocolMap,
 		ListenerTLSConfigMap:            listenerTLSConfigMap,
+		ListenerTLSPolicyMap:            listenerTLSPolicyMap,
 		ListenerDefaultBsMap:            listenerDefaultBsMap,
 		ListenerBackendSetMap:           listenerBackendSetMap,
 	}
@@ -512,12 +537,20 @@ func (s *StateStore) GetTLSConfigForListener(port int32) []TlsConfig {
 	return nil
 }
 
+func (s *StateStore) GetTLSPolicyForListener(port int32) *tlspolicy.ExplicitTLSPolicy {
+	return copyExplicitTLSPolicy(s.IngressGroupState.ListenerTLSPolicyMap[port])
+}
+
 func (s *StateStore) GetTLSConfigForBackendSet(bsName string) TlsConfig {
 	bsTLSConfig, ok := s.IngressGroupState.BackendSetTLSConfigMap[bsName]
 	if ok {
 		return bsTLSConfig
 	}
 	return TlsConfig{}
+}
+
+func (s *StateStore) GetTLSPolicyForBackendSet(bsName string) *tlspolicy.ExplicitTLSPolicy {
+	return copyExplicitTLSPolicy(s.IngressGroupState.BackendSetTLSPolicyMap[bsName])
 }
 
 func (s *StateStore) GetBackendSetSessionPersistence(bsName string) (*ociloadbalancer.SessionPersistenceConfigurationDetails, *ociloadbalancer.LbCookieSessionPersistenceConfigurationDetails) {
@@ -534,6 +567,21 @@ func (s *StateStore) GetAllBackendSetForIngressClass() sets.String {
 
 func (s *StateStore) GetAllListenersForIngressClass() sets.Int32 {
 	return s.IngressGroupState.Listeners
+}
+
+func appendTLSPolicyCandidate[K comparable](candidateMap map[K][]tlsPolicyCandidate, target K, ingress *networkingv1.Ingress, annotationName string) {
+	if ingress == nil || ingress.Annotations == nil {
+		return
+	}
+	value, ok := ingress.Annotations[annotationName]
+	if !ok {
+		return
+	}
+	candidateMap[target] = append(candidateMap[target], tlsPolicyCandidate{
+		IngressKey:     getIngressStateKey(ingress.Namespace, ingress.Name),
+		AnnotationName: annotationName,
+		RawValue:       value,
+	})
 }
 
 func appendListenerBackendSet(listenerBackendSetMap map[int32]sets.String, listenerPort int32, bsName string) {
@@ -587,6 +635,132 @@ func buildListenerTLSConfigMap(listenerTLSCandidateMap map[int32][]listenerTLSCa
 		}
 	}
 	return listenerTLSConfigMap
+}
+
+func buildListenerTLSPolicyMap(candidateMap map[int32][]tlsPolicyCandidate,
+	listenerTLSConfigMap map[int32]ListenerTLSConfig) (map[int32]*tlspolicy.ExplicitTLSPolicy, error) {
+	policyMap := make(map[int32]*tlspolicy.ExplicitTLSPolicy)
+	ports := make([]int32, 0, len(candidateMap))
+	for port := range candidateMap {
+		ports = append(ports, port)
+	}
+	sort.Slice(ports, func(i, j int) bool {
+		return ports[i] < ports[j]
+	})
+
+	for _, port := range ports {
+		listenerTLSConfig := listenerTLSConfigMap[port]
+		if len(listenerTLSConfig.TlsConfigs) == 0 {
+			continue
+		}
+		policy, err := mergeExplicitTLSPolicyCandidates("listener", fmt.Sprintf("%d", port), candidateMap[port])
+		if err != nil {
+			return nil, err
+		}
+		if policy != nil {
+			policyMap[port] = policy
+		}
+	}
+	return policyMap, nil
+}
+
+func buildBackendSetTLSPolicyMap(candidateMap map[string][]tlsPolicyCandidate,
+	bsTLSConfigMap map[string]TlsConfig) (map[string]*tlspolicy.ExplicitTLSPolicy, error) {
+	policyMap := make(map[string]*tlspolicy.ExplicitTLSPolicy)
+	backendSetNames := make([]string, 0, len(candidateMap))
+	for bsName := range candidateMap {
+		backendSetNames = append(backendSetNames, bsName)
+	}
+	sort.Strings(backendSetNames)
+
+	for _, bsName := range backendSetNames {
+		if !hasTLSConfig(bsTLSConfigMap[bsName]) {
+			continue
+		}
+		policy, err := mergeExplicitTLSPolicyCandidates("backend set", bsName, candidateMap[bsName])
+		if err != nil {
+			return nil, err
+		}
+		if policy != nil {
+			policyMap[bsName] = policy
+		}
+	}
+	return policyMap, nil
+}
+
+func mergeExplicitTLSPolicyCandidates(resourceKind string, target string, candidates []tlsPolicyCandidate) (*tlspolicy.ExplicitTLSPolicy, error) {
+	sortedCandidates := make([]tlsPolicyCandidate, len(candidates))
+	copy(sortedCandidates, candidates)
+	sort.SliceStable(sortedCandidates, func(i, j int) bool {
+		if sortedCandidates[i].IngressKey != sortedCandidates[j].IngressKey {
+			return sortedCandidates[i].IngressKey < sortedCandidates[j].IngressKey
+		}
+		if sortedCandidates[i].AnnotationName != sortedCandidates[j].AnnotationName {
+			return sortedCandidates[i].AnnotationName < sortedCandidates[j].AnnotationName
+		}
+		return sortedCandidates[i].RawValue < sortedCandidates[j].RawValue
+	})
+
+	var merged *tlspolicy.ExplicitTLSPolicy
+	var cipherOwner string
+	var protocolsOwner string
+	seenCandidates := make(map[tlsPolicyCandidate]struct{}, len(sortedCandidates))
+	for _, candidate := range sortedCandidates {
+		if _, ok := seenCandidates[candidate]; ok {
+			continue
+		}
+		seenCandidates[candidate] = struct{}{}
+
+		policy, err := tlspolicy.ParseExplicitTLSPolicyAnnotationValue(candidate.AnnotationName, candidate.RawValue)
+		if err != nil {
+			return nil, fmt.Errorf(TLSPolicyInvalidAnnotationMessage, resourceKind, target, candidate.IngressKey, err)
+		}
+		if policy == nil {
+			continue
+		}
+		if merged == nil {
+			merged = &tlspolicy.ExplicitTLSPolicy{}
+		}
+		if policy.HasCipherSuiteName {
+			if merged.HasCipherSuiteName && merged.CipherSuiteName != policy.CipherSuiteName {
+				return nil, fmt.Errorf(TLSPolicyConflictMessage, resourceKind, target, candidate.AnnotationName, "cipherSuiteName",
+					cipherOwner, merged.CipherSuiteName, candidate.IngressKey, policy.CipherSuiteName)
+			}
+			if !merged.HasCipherSuiteName {
+				cipherOwner = candidate.IngressKey
+			}
+			merged.HasCipherSuiteName = true
+			merged.CipherSuiteName = policy.CipherSuiteName
+		}
+		if policy.HasProtocols {
+			if merged.HasProtocols && !reflect.DeepEqual(merged.Protocols, policy.Protocols) {
+				return nil, fmt.Errorf(TLSPolicyConflictMessage, resourceKind, target, candidate.AnnotationName, "protocols",
+					protocolsOwner, merged.Protocols, candidate.IngressKey, policy.Protocols)
+			}
+			if !merged.HasProtocols {
+				protocolsOwner = candidate.IngressKey
+			}
+			merged.HasProtocols = true
+			merged.Protocols = append([]string(nil), policy.Protocols...)
+		}
+	}
+	return copyExplicitTLSPolicy(merged), nil
+}
+
+func hasTLSConfig(config TlsConfig) bool {
+	return config.Type != "" && config.Artifact != ""
+}
+
+func copyExplicitTLSPolicy(policy *tlspolicy.ExplicitTLSPolicy) *tlspolicy.ExplicitTLSPolicy {
+	if policy == nil {
+		return nil
+	}
+	return &tlspolicy.ExplicitTLSPolicy{
+		HasCipherSuiteName: policy.HasCipherSuiteName,
+		CipherSuiteName:    policy.CipherSuiteName,
+		HasProtocols:       policy.HasProtocols,
+		Protocols:          append([]string(nil), policy.Protocols...),
+	}
 }
 
 func dedupeListenerTLSConfigs(candidates []listenerTLSCandidate) []TlsConfig {

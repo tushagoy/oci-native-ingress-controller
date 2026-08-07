@@ -30,6 +30,7 @@ import (
 	"github.com/oracle/oci-native-ingress-controller/pkg/loadbalancer"
 	"github.com/oracle/oci-native-ingress-controller/pkg/metric"
 	"github.com/oracle/oci-native-ingress-controller/pkg/state"
+	"github.com/oracle/oci-native-ingress-controller/pkg/tlspolicy"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -402,6 +403,10 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		return err
 	}
 
+	if err := validateActiveTLSPolicies(stateStore, lb); err != nil {
+		return err
+	}
+
 	managedMultiCertBackendSets, err := buildManagedMultiCertBackendSets(stateStore, lb, certificateCompartmentId, c, wrapperClient)
 	if err != nil {
 		return err
@@ -436,15 +441,18 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		if err != nil {
 			return err
 		}
-		backendSetPolicy := selectBackendSetMultiCertTLSPolicy(bsName, backendSetSslConfig, managedMultiCertBackendSets)
-		applyTLSPolicyToSSLConfig(backendSetSslConfig, backendSetPolicy)
+		backendSetPolicy, err := resolveTLSPolicy(tlsPolicyResourceBackendSet, "", backendSetSslConfig,
+			stateStore.GetTLSPolicyForBackendSet(bsName), true, nil)
+		if err != nil {
+			return fmt.Errorf("backend set %s: %w", bsName, err)
+		}
 
 		healthChecker := stateStore.GetBackendSetHealthChecker(bsName)
 		policy := stateStore.GetBackendSetPolicy(bsName)
 		appCookie, lbCookie := stateStore.GetBackendSetSessionPersistence(bsName)
 		err = wrapperClient.GetLbClient().CreateBackendSet(context.TODO(), lbId, bsName, policy, healthChecker, backendSetSslConfig, appCookie, lbCookie)
 		if err != nil {
-			return wrapBackendSetTLSPolicyStageError(err, ingressClass.Name, bsName, backendSetPolicy, backendSetPolicy != nil)
+			return wrapBackendSetTLSPolicyStageError(err, ingressClass.Name, bsName, backendSetPolicy, false)
 		}
 		stagedBackendSetPolicy = stagedBackendSetPolicy || backendSetPolicy != nil
 		endBuildTime := util.GetCurrentTimeInUnixMillis()
@@ -501,11 +509,11 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		}
 
 		protocol := stateStore.GetListenerProtocol(port)
-		listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, listenerSslConfig)
+		_, err = resolveTLSPolicy(tlsPolicyResourceListener, protocol, listenerSslConfig,
+			stateStore.GetTLSPolicyForListener(port), true, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("listener %d: %w", port, err)
 		}
-		applyTLSPolicyToSSLConfig(listenerSslConfig, listenerPolicy)
 		defaultBackendSet := stateStore.GetListenerDefaultBackendSet(port)
 		err = wrapperClient.GetLbClient().CreateListener(context.TODO(), lbId, int(port), protocol, defaultBackendSet, listenerSslConfig)
 		if err != nil {
@@ -607,6 +615,58 @@ func deleteListeners(actualListeners sets.Int32, desiredListeners sets.Int32, lb
 	return nil
 }
 
+func validateActiveTLSPolicies(stateStore *state.StateStore, lb *ociloadbalancer.LoadBalancer) error {
+	for _, bsName := range stateStore.GetAllBackendSetForIngressClass().List() {
+		explicitPolicy := stateStore.GetTLSPolicyForBackendSet(bsName)
+		backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+		if explicitPolicy == nil || !tlsConfigIsActive(backendTLSConfig) {
+			continue
+		}
+
+		var currentSSLConfig *ociloadbalancer.SslConfiguration
+		isSSLConfigCreate := true
+		if bs, ok := lb.BackendSets[bsName]; ok {
+			currentSSLConfig = bs.SslConfiguration
+			isSSLConfigCreate = bs.SslConfiguration == nil
+		}
+
+		_, err := resolveTLSPolicy(tlsPolicyResourceBackendSet, "", &ociloadbalancer.SslConfigurationDetails{},
+			explicitPolicy, isSSLConfigCreate, currentSSLConfig)
+		if err != nil {
+			return fmt.Errorf("backend set %s: %w", bsName, err)
+		}
+	}
+
+	for _, port := range stateStore.GetAllListenersForIngressClass().List() {
+		explicitPolicy := stateStore.GetTLSPolicyForListener(port)
+		if explicitPolicy == nil || len(stateStore.GetTLSConfigForListener(port)) == 0 {
+			continue
+		}
+
+		protocol := stateStore.GetListenerProtocol(port)
+		listenerName := util.GenerateListenerName(port)
+		var currentSSLConfig *ociloadbalancer.SslConfiguration
+		isSSLConfigCreate := true
+		if listener, ok := lb.Listeners[listenerName]; ok {
+			currentSSLConfig = listener.SslConfiguration
+			isSSLConfigCreate = listener.SslConfiguration == nil ||
+				listenerProtocolTransitionShouldUseDefault(listener.Protocol, protocol, listener.SslConfiguration)
+		}
+
+		_, err := resolveTLSPolicy(tlsPolicyResourceListener, protocol, &ociloadbalancer.SslConfigurationDetails{},
+			explicitPolicy, isSSLConfigCreate, currentSSLConfig)
+		if err != nil {
+			return fmt.Errorf("listener %d: %w", port, err)
+		}
+	}
+
+	return nil
+}
+
+func tlsConfigIsActive(tlsConfig state.TlsConfig) bool {
+	return tlsConfig.Type != "" && tlsConfig.Artifact != ""
+}
+
 func buildManagedMultiCertBackendSets(stateStore *state.StateStore, lb *ociloadbalancer.LoadBalancer, certificateCompartmentId string,
 	c *Controller, wrapperClient *client.WrapperClient) (sets.String, error) {
 	managedBackendSets := sets.NewString()
@@ -625,11 +685,7 @@ func buildManagedMultiCertBackendSets(stateStore *state.StateStore, lb *ociloadb
 		}
 
 		protocol := stateStore.GetListenerProtocol(port)
-		listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, sslConfig)
-		if err != nil {
-			return nil, err
-		}
-		if listenerPolicy == nil && !listenerHasManagedMultiCertTLSPolicy(listenerPtr) {
+		if !listenerSSLConfigHasMultipleCertificates(protocol, sslConfig) && !listenerHasMultipleCertificates(listenerPtr) {
 			continue
 		}
 
@@ -669,12 +725,11 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 	}
 
 	protocol := stateStore.GetListenerProtocol(int32(*listener.Port))
-	listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, sslConfig)
+	listenerProtocolTransitionDefault := listenerProtocolTransitionShouldUseDefault(listener.Protocol, protocol, listener.SslConfiguration)
+	listenerPolicy, err := resolveTLSPolicy(tlsPolicyResourceListener, protocol, sslConfig,
+		stateStore.GetTLSPolicyForListener(int32(*listener.Port)), listener.SslConfiguration == nil || listenerProtocolTransitionDefault, listener.SslConfiguration)
 	if err != nil {
-		return err
-	}
-	if listenerPolicy != nil {
-		applyTLSPolicyToSSLConfig(sslConfig, listenerPolicy)
+		return fmt.Errorf("listener %d: %w", *listener.Port, err)
 	}
 
 	clearListenerSSL := false
@@ -702,11 +757,6 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 	}
 
 	if needsUpdate {
-		if listenerPolicy == nil && sslConfig != nil {
-			if err := preserveListenerTLSPolicy(sslConfig, listener.SslConfiguration); err != nil {
-				return err
-			}
-		}
 		if clearListenerSSL {
 			err = wrapperClient.GetLbClient().ClearListenerSSL(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, &protocol, &defaultBackendSet)
 		} else {
@@ -721,6 +771,26 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 		c.metricsCollector.AddIngressListenerSyncTime(util.GetTimeDifferenceInSeconds(startTime, endTime))
 	}
 	return nil
+}
+
+func listenerProtocolTransitionShouldUseDefault(currentProtocol *string, desiredProtocol string, currentSSLConfig *ociloadbalancer.SslConfiguration) bool {
+	if desiredProtocol == "" || currentProtocol == nil || *currentProtocol == desiredProtocol {
+		return false
+	}
+	if util.IsListenerProtocolUsingHTTP2CipherSuite(desiredProtocol) {
+		return currentListenerPolicyMatches(currentSSLConfig, LockedDefaultTLSPolicy.Listener)
+	}
+	if desiredProtocol == util.ProtocolHTTP && util.IsListenerProtocolUsingHTTP2CipherSuite(*currentProtocol) {
+		return currentListenerPolicyMatches(currentSSLConfig, LockedDefaultTLSPolicy.HTTP2Listener)
+	}
+	return false
+}
+
+func currentListenerPolicyMatches(currentSSLConfig *ociloadbalancer.SslConfiguration, policy TLSPolicy) bool {
+	if currentSSLConfig == nil || currentSSLConfig.CipherSuiteName == nil {
+		return false
+	}
+	return *currentSSLConfig.CipherSuiteName == policy.CipherSuiteName && tlsProtocolsEqual(currentSSLConfig.Protocols, policy.Protocols)
 }
 
 func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, ingressClassName string, lbID string, backendSetName string,
@@ -752,9 +822,10 @@ func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, ingressC
 	if err != nil {
 		return false, err
 	}
-	backendSetPolicy := selectBackendSetMultiCertTLSPolicy(*bs.Name, sslConfig, managedMultiCertBackendSets)
-	if backendSetPolicy != nil {
-		applyTLSPolicyToSSLConfig(sslConfig, backendSetPolicy)
+	backendSetPolicy, err := resolveTLSPolicy(tlsPolicyResourceBackendSet, "", sslConfig,
+		stateStore.GetTLSPolicyForBackendSet(*bs.Name), bs.SslConfiguration == nil, bs.SslConfiguration)
+	if err != nil {
+		return false, fmt.Errorf("backend set %s: %w", *bs.Name, err)
 	}
 
 	backendSetSSLNeedsUpdate := backendSetSslConfigNeedsUpdate(sslConfig, &bs, backendSetPolicy != nil)
@@ -795,11 +866,6 @@ func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, ingressC
 	}
 
 	if needsUpdate {
-		if backendSetPolicy == nil && sslConfig != nil {
-			if err := preserveBackendSetTLSPolicy(sslConfig, bs.SslConfiguration); err != nil {
-				return false, err
-			}
-		}
 		err = wrapperClient.GetLbClient().UpdateBackendSetDetails(context.TODO(), *lb.Id, etag, &bs, sslConfig, healthChecker, policy, desiredAppCookie, desiredLbCookie)
 		if err != nil {
 			return false, wrapBackendSetTLSPolicyStageError(err, ingressClassName, *bs.Name, backendSetPolicy, stagingManagedMultiCertBackendSet)
@@ -822,8 +888,12 @@ func wrapBackendSetTLSPolicyStageError(err error, ingressClassName string, backe
 		return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s backendSet=%s policy=managed-multi-cert-backend-set action=clear-incompatible-backend-set-ssl: %w",
 			ingressClassName, backendSetName, err)
 	}
-	return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s backendSet=%s policy=managed-multi-cert-backend-set cipherSuite=%s protocols=%v: %w",
-		ingressClassName, backendSetName, policy.CipherSuiteName, policy.Protocols, err)
+	policySource := "backend-set-tls-policy"
+	if stagingManagedMultiCertBackendSet {
+		policySource = "managed-multi-cert-backend-set"
+	}
+	return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s backendSet=%s policy=%s cipherSuite=%s protocols=%v: %w",
+		ingressClassName, backendSetName, policySource, policy.CipherSuiteName, policy.Protocols, err)
 }
 
 func (c *Controller) deleteIngress(i *networkingv1.Ingress) error {
@@ -846,7 +916,8 @@ func (c *Controller) handleErr(err error, key interface{}) {
 		c.queue.Forget(key)
 		return
 	} else if c.eventRecorder != nil {
-		util.PublishWarningEventForIngress(c.eventRecorder, c.ingressLister, key, err, "IngressReconcileFailed", "IngressReconcile")
+		reason := tlspolicy.ClassifyWarningEventReason(err, "IngressReconcileFailed")
+		util.PublishWarningEventForIngress(c.eventRecorder, c.ingressLister, key, err, reason, "IngressReconcile")
 	}
 
 	if errors.Is(err, errIngressClassNotReady) {

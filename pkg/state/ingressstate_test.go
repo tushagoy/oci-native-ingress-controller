@@ -991,6 +991,190 @@ func TestListenerBackendSetParticipationDedupesRoutingPolicyBackendSetReferences
 	Expect(stateStore.GetBackendSetsForListener(80).List()).To(Equal(expectedBackendSets.List()))
 }
 
+func TestIngressStateTLSPolicyPropagatesToListenerPortAndBackendSetName(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingress := makeIngress("ing-tls-policy", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressListenerSslConfigAnnotation:      `{"protocols":["TLSv1.3","TLSv1.2"]}`,
+		util.IngressBackendSetSslConfigAnnotation:    `{"cipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3"}`,
+	}, "svc-a", 9443)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingress)
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerPolicy := stateStore.GetTLSPolicyForListener(9443)
+	Expect(listenerPolicy).NotTo(BeNil())
+	Expect(listenerPolicy.HasCipherSuiteName).To(BeFalse())
+	Expect(listenerPolicy.HasProtocols).To(BeTrue())
+	Expect(listenerPolicy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+
+	bsName := util.GenerateBackendSetName("default", "svc-a", 9443)
+	backendSetPolicy := stateStore.GetTLSPolicyForBackendSet(bsName)
+	Expect(backendSetPolicy).NotTo(BeNil())
+	Expect(backendSetPolicy.HasCipherSuiteName).To(BeTrue())
+	Expect(backendSetPolicy.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(backendSetPolicy.HasProtocols).To(BeFalse())
+}
+
+func TestIngressStateTLSPolicyMissingAnnotationMeansNoOpinion(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingress := makeIngress("ing-no-policy", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+	}, "svc-a", 9443)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingress)
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(stateStore.GetTLSPolicyForListener(9443)).To(BeNil())
+	Expect(stateStore.GetTLSPolicyForBackendSet(util.GenerateBackendSetName("default", "svc-a", 9443))).To(BeNil())
+}
+
+func TestIngressStateTLSPolicyMergesComplementaryListenerAnnotations(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressA := makeIngress("ing-a", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressListenerSslConfigAnnotation:      `{"cipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3"}`,
+	}, "svc-a", 8080)
+	ingressB := makeIngress("ing-b", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateB",
+		util.IngressListenerSslConfigAnnotation:      `{"protocols":["TLSv1.3","TLSv1.2"]}`,
+	}, "svc-b", 8081)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingressB, ingressA)
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerPolicy := stateStore.GetTLSPolicyForListener(443)
+	Expect(listenerPolicy).NotTo(BeNil())
+	Expect(listenerPolicy.HasCipherSuiteName).To(BeTrue())
+	Expect(listenerPolicy.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(listenerPolicy.HasProtocols).To(BeTrue())
+	Expect(listenerPolicy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestIngressStateTLSPolicyMergesComplementaryBackendSetAnnotations(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressA := makeIngress("ing-a", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressBackendSetSslConfigAnnotation:    `{"cipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3"}`,
+	}, "svc-a", 9443)
+	ingressB := makeIngress("ing-b", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressBackendSetSslConfigAnnotation:    `{"protocols":["TLSv1.3","TLSv1.2"]}`,
+	}, "svc-a", 9443)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingressB, ingressA)
+	Expect(err).NotTo(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "svc-a", 9443)
+	backendSetPolicy := stateStore.GetTLSPolicyForBackendSet(bsName)
+	Expect(backendSetPolicy).NotTo(BeNil())
+	Expect(backendSetPolicy.HasCipherSuiteName).To(BeTrue())
+	Expect(backendSetPolicy.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(backendSetPolicy.HasProtocols).To(BeTrue())
+	Expect(backendSetPolicy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestIngressStateTLSPolicyEquivalentProtocolSetsDoNotConflict(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressA := makeIngress("ing-a", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressListenerSslConfigAnnotation:      `{"protocols":["TLSv1.3","TLSv1.2"]}`,
+	}, "svc-a", 8080)
+	ingressB := makeIngress("ing-b", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateB",
+		util.IngressListenerSslConfigAnnotation:      `{"protocols":["TLSv1.2","TLSv1.3","TLSv1.2"]}`,
+	}, "svc-b", 8081)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingressB, ingressA)
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerPolicy := stateStore.GetTLSPolicyForListener(443)
+	Expect(listenerPolicy).NotTo(BeNil())
+	Expect(listenerPolicy.HasProtocols).To(BeTrue())
+	Expect(listenerPolicy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestIngressStateTLSPolicyConflictingListenerAnnotationsFailDeterministically(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressA := makeIngress("ing-a", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressListenerSslConfigAnnotation:      `{"cipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3"}`,
+	}, "svc-a", 8080)
+	ingressB := makeIngress("ing-b", map[string]string{
+		util.IngressHttpsListenerPortAnnotation:      "443",
+		util.IngressListenerTlsCertificateAnnotation: "certificateB",
+		util.IngressListenerSslConfigAnnotation:      `{"cipherSuiteName":"oci-default-http2-tls-12-13-ssl-cipher-suite-v1"}`,
+	}, "svc-b", 8081)
+
+	_, errAB := buildStateForTLSPolicyTest(t, ingressA, ingressB)
+	_, errBA := buildStateForTLSPolicyTest(t, ingressB, ingressA)
+	Expect(errAB).To(MatchError(errBA.Error()))
+	Expect(errAB.Error()).To(ContainSubstring("TLSPolicyConflict: listener 443"))
+	Expect(errAB.Error()).To(ContainSubstring("field cipherSuiteName"))
+	Expect(errAB.Error()).To(ContainSubstring("default/ing-a"))
+	Expect(errAB.Error()).To(ContainSubstring("default/ing-b"))
+}
+
+func TestIngressStateTLSPolicyConflictingBackendSetAnnotationsFailDeterministically(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressA := makeIngress("ing-a", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressBackendSetSslConfigAnnotation:    `{"protocols":["TLSv1.2"]}`,
+	}, "svc-a", 9443)
+	ingressB := makeIngress("ing-b", map[string]string{
+		util.IngressListenerTlsCertificateAnnotation: "certificateA",
+		util.IngressBackendSetSslConfigAnnotation:    `{"protocols":["TLSv1.3"]}`,
+	}, "svc-a", 9443)
+
+	_, errAB := buildStateForTLSPolicyTest(t, ingressA, ingressB)
+	_, errBA := buildStateForTLSPolicyTest(t, ingressB, ingressA)
+	bsName := util.GenerateBackendSetName("default", "svc-a", 9443)
+	Expect(errAB).To(MatchError(errBA.Error()))
+	Expect(errAB.Error()).To(ContainSubstring("TLSPolicyConflict: backend set " + bsName))
+	Expect(errAB.Error()).To(ContainSubstring("field protocols"))
+	Expect(errAB.Error()).To(ContainSubstring("default/ing-a"))
+	Expect(errAB.Error()).To(ContainSubstring("default/ing-b"))
+}
+
+func TestIngressStateTLSPolicyAnnotationsAreInertWithoutTLSInputs(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingress := makeIngress("ing-no-tls", map[string]string{
+		util.IngressListenerSslConfigAnnotation:   `{not-json`,
+		util.IngressBackendSetSslConfigAnnotation: `{not-json`,
+	}, "svc-a", 8080)
+
+	stateStore, err := buildStateForTLSPolicyTest(t, ingress)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(stateStore.GetTLSPolicyForListener(8080)).To(BeNil())
+	Expect(stateStore.GetTLSPolicyForBackendSet(util.GenerateBackendSetName("default", "svc-a", 8080))).To(BeNil())
+}
+
+func buildStateForTLSPolicyTest(t *testing.T, ingresses ...networkingv1.Ingress) (*StateStore, error) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := &networkingv1.IngressList{Items: ingresses}
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, &v1.ServiceList{})
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	return stateStore, stateStore.BuildState(&ingressClassList.Items[0])
+}
+
 type ingressPathSpec struct {
 	Path        string
 	ServiceName string
