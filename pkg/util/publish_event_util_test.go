@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -24,7 +25,6 @@ import (
 	"k8s.io/client-go/tools/events"
 
 	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
-	corev1 "k8s.io/api/core/v1"
 )
 
 func getListers(ingress *networkingv1.Ingress, ingressClass *networkingv1.IngressClass) (networkinglisters.IngressLister, networkinglisters.IngressClassLister) {

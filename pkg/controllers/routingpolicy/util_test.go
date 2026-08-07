@@ -10,17 +10,17 @@ package routingpolicy
 
 import (
 	"fmt"
-	"github.com/oracle/oci-go-sdk/v65/common"
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/tools/events"
 	"testing"
 	"time"
 
 	. "github.com/onsi/gomega"
+	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 )
 

@@ -2,14 +2,12 @@ package routingpolicy
 
 import (
 	"context"
-	"github.com/oracle/oci-go-sdk/v65/common"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/tools/events"
 	"sort"
 	"sync"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/oracle/oci-go-sdk/v65/common"
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"github.com/oracle/oci-native-ingress-controller/pkg/client"
 	lb "github.com/oracle/oci-native-ingress-controller/pkg/loadbalancer"
@@ -20,9 +18,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	networkinginformers "k8s.io/client-go/informers/networking/v1"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/events"
 
 	"k8s.io/client-go/tools/cache"
 )
