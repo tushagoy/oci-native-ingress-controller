@@ -22,7 +22,7 @@ image:
   repository: ghcr.io/oracle/oci-native-ingress-controller
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "v1.4.3"
+  tag: "v1.4.5"
 
 imagePullSecrets: []
 nameOverride: ""
@@ -138,4 +138,3 @@ emitEvents: false
 # Integer number of days to wait before an unused OCI Certificate service resource managed by NIC is deleted
 # This cleanup is done periodically by NIC
 # If less than or equal to 0, certificate resource cleanup is disabled
-certDeletionGracePeriodInDays: 0
