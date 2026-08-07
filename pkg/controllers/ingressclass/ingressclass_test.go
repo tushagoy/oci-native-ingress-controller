@@ -638,7 +638,6 @@ func (n NetworkError) Error() string {
 }
 
 func (m *MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerRequest) (response ociloadbalancer.UpdateLoadBalancerResponse, err error) {
-	updateCount++
 	return ociloadbalancer.UpdateLoadBalancerResponse{
 		RawResponse:      nil,
 		OpcWorkRequestId: common.String("id"),

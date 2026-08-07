@@ -1749,7 +1749,7 @@ func TestSyncListenerClearsStaleSSLConfigWhenTLSNotDesired(t *testing.T) {
 		Mu:       sync.Mutex{},
 		Cache:    map[string]*lb.LbCacheObj{},
 	}
-	wrapperClient := client.NewWrapperClient(nil, nil, loadBalancerClient, nil, nil)
+	wrapperClient := client.NewWrapperClient(nil, nil, loadBalancerClient, nil, nil, nil)
 	ctx := context.WithValue(context.Background(), util.WrapperClient, wrapperClient)
 	stateStore := &state.StateStore{
 		IngressGroupState: state.IngressClassState{
@@ -1759,11 +1759,11 @@ func TestSyncListenerClearsStaleSSLConfigWhenTLSNotDesired(t *testing.T) {
 			ListenerDefaultBsMap: map[int32]string{
 				int32(port): defaultBackendSet,
 			},
-			ListenerTLSConfigMap: map[int32]state.TlsConfig{},
+			ListenerTLSConfigMap: map[int32]state.ListenerTLSConfig{},
 		},
 	}
 
-	err := syncListener(ctx, namespace, stateStore, &lbId, listenerName, "", &Controller{})
+	err := syncListener(ctx, stateStore, &lbId, listenerName, "", &Controller{})
 
 	Expect(err).To(BeNil())
 	Expect(mockClient.updateListenerRequest).ToNot(BeNil())
