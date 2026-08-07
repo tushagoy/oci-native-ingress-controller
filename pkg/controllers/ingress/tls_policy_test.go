@@ -38,20 +38,25 @@ func TestSelectListenerMultiCertTLSPolicyNoopForSingleCertAndTCP(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(policy).To(BeNil())
 
+	policy, err = selectListenerMultiCertTLSPolicy(util.ProtocolHTTP2, singleCertConfig)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(policy).To(BeNil())
+
 	tcpConfig := &ociloadbalancer.SslConfigurationDetails{CertificateIds: []string{"cert-a", "cert-b"}}
 	policy, err = selectListenerMultiCertTLSPolicy(util.ProtocolTCP, tcpConfig)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(policy).To(BeNil())
 }
 
-func TestSelectListenerMultiCertTLSPolicyRejectsHTTP2(t *testing.T) {
+func TestSelectListenerMultiCertTLSPolicySupportsHTTP2(t *testing.T) {
 	RegisterTestingT(t)
 
 	sslConfig := &ociloadbalancer.SslConfigurationDetails{CertificateIds: []string{"cert-a", "cert-b"}}
 	policy, err := selectListenerMultiCertTLSPolicy(util.ProtocolHTTP2, sslConfig)
-	Expect(err).To(HaveOccurred())
-	Expect(err.Error()).To(ContainSubstring("TLSPolicyUnsupported"))
-	Expect(policy).To(BeNil())
+	Expect(err).NotTo(HaveOccurred())
+	Expect(policy).NotTo(BeNil())
+	Expect(policy.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(policy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
 func TestSelectBackendSetMultiCertTLSPolicy(t *testing.T) {

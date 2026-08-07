@@ -764,24 +764,26 @@ func TestLoadBalancerClient_HTTP2DefaultDoesNotOverrideExplicitTLSPolicy(t *test
 		Protocol: &proto,
 	}
 	createSslConfig := getSslConfigurationDetails(id)
-	createSslConfig.CertificateIds = []string{"cert-a"}
-	createSslConfig.CipherSuiteName = common.String("planner-cipher")
-	createSslConfig.Protocols = []string{"TLSv1.2"}
+	createSslConfig.CertificateIds = []string{"cert-a", "cert-b"}
+	createSslConfig.CipherSuiteName = common.String("oci-tls-12-13-ssl-cipher-suite-v3")
+	createSslConfig.Protocols = []string{"TLSv1.2", "TLSv1.3"}
 	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP2, util.DefaultBackendSetName, &createSslConfig)
 	Expect(err).To(BeNil())
 	Expect(capturedCreateListenerRequest).ToNot(BeNil())
-	Expect(*capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("planner-cipher"))
-	Expect(capturedCreateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2"}))
+	Expect(capturedCreateListenerRequest.SslConfiguration.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	Expect(*capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(capturedCreateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 
 	updateSslConfig := getSslConfigurationDetails(id)
-	updateSslConfig.CertificateIds = []string{"cert-a"}
-	updateSslConfig.CipherSuiteName = common.String("planner-cipher")
-	updateSslConfig.Protocols = []string{"TLSv1.2"}
+	updateSslConfig.CertificateIds = []string{"cert-a", "cert-b"}
+	updateSslConfig.CipherSuiteName = common.String("oci-tls-12-13-ssl-cipher-suite-v3")
+	updateSslConfig.Protocols = []string{"TLSv1.2", "TLSv1.3"}
 	err = loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &updateSslConfig, &proto, nil)
 	Expect(err).To(BeNil())
 	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
-	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("planner-cipher"))
-	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2"}))
+	Expect(capturedUpdateListenerRequest.SslConfiguration.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
 func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {

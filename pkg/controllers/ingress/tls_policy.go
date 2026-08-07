@@ -47,9 +47,6 @@ func selectListenerMultiCertTLSPolicy(protocol string, sslConfig *ociloadbalance
 	if sslConfig == nil || len(sslConfig.CertificateIds) <= 1 {
 		return nil, nil
 	}
-	if protocol == util.ProtocolHTTP2 {
-		return nil, fmt.Errorf("TLSPolicyUnsupported: HTTP/2 multi-cert listeners are not supported")
-	}
 	if protocol == util.ProtocolTCP {
 		return nil, nil
 	}
