@@ -275,6 +275,20 @@ func TestGetSSLConfigForBackendSet(t *testing.T) {
 	Expect(err).Should(BeNil())
 	Expect(config != nil).Should(BeTrue())
 
+	policyBackendSetName := util.GenerateBackendSetName(namespace, "policy-service", 80)
+	lb.BackendSets[policyBackendSetName] = ociloadbalancer.BackendSet{
+		Name: common.String(policyBackendSetName),
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			TrustedCertificateAuthorityIds: []string{"authId"},
+			CipherSuiteName:                common.String("existing-cipher"),
+			Protocols:                      []string{"TLSv1.3", "TLSv1.2"},
+		},
+	}
+	config, err = GetSSLConfigForBackendSet(namespace, state.ArtifactTypeCertificate, string(certificatesmanagement.CertificateConfigTypeIssuedByInternalCa), &lb, policyBackendSetName, "", secretLister, mockClient)
+	Expect(err).Should(BeNil())
+	Expect(*config.CipherSuiteName).Should(Equal("existing-cipher"))
+	Expect(config.Protocols).Should(Equal([]string{"TLSv1.3", "TLSv1.2"}))
+
 	// No ca bundle scenario
 	config, err = GetSSLConfigForBackendSet(namespace, state.ArtifactTypeCertificate, errorImportCert, &lb, "testecho1", "", secretLister, mockClient)
 	Expect(err).Should(BeNil())
@@ -323,7 +337,9 @@ func TestGetSSLConfigForListener(t *testing.T) {
 
 	listener := ociloadbalancer.Listener{
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
-			CertificateIds: []string{"existing-1", "existing-2"},
+			CertificateIds:  []string{"existing-1", "existing-2"},
+			CipherSuiteName: common.String("existing-cipher"),
+			Protocols:       []string{"TLSv1.3", "TLSv1.2"},
 		},
 	}
 	tlsConfigs = []state.TlsConfig{
@@ -336,6 +352,8 @@ func TestGetSSLConfigForListener(t *testing.T) {
 	Expect(err).Should(BeNil())
 	Expect(sslConfig != nil).Should(BeTrue())
 	Expect(sslConfig.CertificateIds).Should(Equal([]string{"direct-a", "id"}))
+	Expect(*sslConfig.CipherSuiteName).Should(Equal("existing-cipher"))
+	Expect(sslConfig.Protocols).Should(Equal([]string{"TLSv1.3", "TLSv1.2"}))
 
 	listener = ociloadbalancer.Listener{
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
@@ -451,15 +469,44 @@ func TestBackendSetSslConfigNeedsUpdate(t *testing.T) {
 			TrustedCertificateAuthorityIds: caBundleId2,
 		},
 	}
+	presentBackendSetWithPolicy := &ociloadbalancer.BackendSet{
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			TrustedCertificateAuthorityIds: caBundleId1,
+			CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+			Protocols:                      DefaultMultiCertTLSPolicy.BackendSet.Protocols,
+		},
+	}
 	calculatedConfig1 := &ociloadbalancer.SslConfigurationDetails{
 		TrustedCertificateAuthorityIds: caBundleId1,
 	}
+	calculatedConfigWithPolicy := &ociloadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: caBundleId1,
+		CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+		Protocols:                      DefaultMultiCertTLSPolicy.BackendSet.Protocols,
+	}
 
-	Expect(backendSetSslConfigNeedsUpdate(nil, backendSetWithNilSslConfig)).To(BeFalse())
-	Expect(backendSetSslConfigNeedsUpdate(nil, presentBackendSet1)).To(BeTrue())
-	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, presentBackendSet1)).To(BeFalse())
-	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, presentBackendSet2)).To(BeTrue())
-	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, backendSetWithNilSslConfig)).To(BeTrue())
+	Expect(backendSetSslConfigNeedsUpdate(nil, backendSetWithNilSslConfig, false)).To(BeFalse())
+	Expect(backendSetSslConfigNeedsUpdate(nil, presentBackendSet1, false)).To(BeTrue())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, presentBackendSet1, false)).To(BeFalse())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, presentBackendSet2, false)).To(BeTrue())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfig1, backendSetWithNilSslConfig, false)).To(BeTrue())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfigWithPolicy, presentBackendSet1, true)).To(BeTrue())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfigWithPolicy, presentBackendSet1, false)).To(BeFalse())
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfigWithPolicy, presentBackendSetWithPolicy, true)).To(BeFalse())
+
+	presentBackendSetWithReorderedProtocols := &ociloadbalancer.BackendSet{
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			TrustedCertificateAuthorityIds: caBundleId1,
+			CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+			Protocols:                      []string{"TLSv1.3", "TLSv1.2"},
+		},
+	}
+	calculatedConfigWithReorderedProtocols := &ociloadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: caBundleId1,
+		CipherSuiteName:                common.String(DefaultMultiCertTLSPolicy.BackendSet.CipherSuiteName),
+		Protocols:                      []string{"TLSv1.2", "TLSv1.3"},
+	}
+	Expect(backendSetSslConfigNeedsUpdate(calculatedConfigWithReorderedProtocols, presentBackendSetWithReorderedProtocols, true)).To(BeFalse())
 }
 
 func TestGetCertificateNameFromSecret(t *testing.T) {

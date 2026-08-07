@@ -27,6 +27,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const ociCustomizedCipherSuiteName = "oci-customized-ssl-cipher-suite"
+
 type LbCacheObj struct {
 	LB   *loadbalancer.LoadBalancer
 	Age  time.Time
@@ -218,6 +220,11 @@ func (lbc *LoadBalancerClient) GetLoadBalancer(ctx context.Context, lbID string)
 		klog.Infof("Refreshing LB cache for lb %s ", lbID)
 	}
 
+	return lbc.getLoadBalancerBustCache(ctx, lbID)
+}
+
+// RefreshLoadBalancer bypasses the local cache and stores the fresh load balancer response.
+func (lbc *LoadBalancerClient) RefreshLoadBalancer(ctx context.Context, lbID string) (*loadbalancer.LoadBalancer, string, error) {
 	return lbc.getLoadBalancerBustCache(ctx, lbID)
 }
 
@@ -588,11 +595,9 @@ func (lbc *LoadBalancerClient) UpdateBackends(ctx context.Context, lbID string, 
 		return nil
 	}
 
-	var sslConfig *loadbalancer.SslConfigurationDetails
-	if backendSet.SslConfiguration != nil {
-		sslConfig = &loadbalancer.SslConfigurationDetails{
-			TrustedCertificateAuthorityIds: backendSet.SslConfiguration.TrustedCertificateAuthorityIds,
-		}
+	sslConfig, err := backendSetSslConfigurationDetailsFromCurrent(backendSet.SslConfiguration)
+	if err != nil {
+		return err
 	}
 
 	healthCheckerDetails := &loadbalancer.HealthCheckerDetails{
@@ -619,6 +624,13 @@ func (lbc *LoadBalancerClient) UpdateBackendSetDetails(ctx context.Context, lbID
 	healthCheckerDetails *loadbalancer.HealthCheckerDetails, policy string,
 	appCookie *loadbalancer.SessionPersistenceConfigurationDetails,
 	lbCookie *loadbalancer.LbCookieSessionPersistenceConfigurationDetails) error {
+	if sslConfig != nil {
+		var err error
+		sslConfig, err = backendSetSslConfigurationDetailsWithPreservedPolicy(sslConfig, backendSet.SslConfiguration)
+		if err != nil {
+			return err
+		}
+	}
 
 	backends := make([]loadbalancer.BackendDetails, len(backendSet.Backends))
 	for i := range backendSet.Backends {
@@ -708,12 +720,87 @@ func (lbc *LoadBalancerClient) setRoutingPolicyOnListener(
 	return lbc.UpdateListener(ctx, lb.Id, etag, l, &routingPolicyName, nil, l.Protocol, nil, true)
 }
 
-func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
-	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string, preserveExistingSslConfig bool) error {
+func listenerSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if current == nil {
+		return nil, nil
+	}
+	if err := ensureRequestableCipherSuite("listener", current.CipherSuiteName); err != nil {
+		return nil, err
+	}
+	return &loadbalancer.SslConfigurationDetails{
+		CertificateIds:  current.CertificateIds,
+		CipherSuiteName: current.CipherSuiteName,
+		Protocols:       current.Protocols,
+	}, nil
+}
 
-	if preserveExistingSslConfig && sslConfigurationDetails == nil && l.SslConfiguration != nil {
-		sslConfigurationDetails = &loadbalancer.SslConfigurationDetails{
-			CertificateIds: l.SslConfiguration.CertificateIds,
+func backendSetSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if current == nil {
+		return nil, nil
+	}
+	if err := ensureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+		return nil, err
+	}
+	return &loadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: current.TrustedCertificateAuthorityIds,
+		CipherSuiteName:                current.CipherSuiteName,
+		Protocols:                      current.Protocols,
+	}, nil
+}
+
+func backendSetSslConfigurationDetailsWithPreservedPolicy(desired *loadbalancer.SslConfigurationDetails,
+	current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if desired == nil || current == nil {
+		return desired, nil
+	}
+	if desired.CipherSuiteName == nil && current.CipherSuiteName != nil {
+		if err := ensureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+			return nil, err
+		}
+		desired.CipherSuiteName = current.CipherSuiteName
+	}
+	if len(desired.Protocols) == 0 {
+		desired.Protocols = current.Protocols
+	}
+	return desired, nil
+}
+
+func ensureRequestableCipherSuite(resourceKind string, cipherSuiteName *string) error {
+	if cipherSuiteName != nil && *cipherSuiteName == ociCustomizedCipherSuiteName {
+		return fmt.Errorf("TLSPolicyPreserveFailed: cannot preserve non-requestable %s cipherSuiteName %q", resourceKind, *cipherSuiteName)
+	}
+	return nil
+}
+
+func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
+	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string) error {
+	return lbc.updateListener(ctx, lbId, etag, l, routingPolicyName, sslConfigurationDetails, protocol, defaultBackendSet, true)
+}
+
+func (lbc *LoadBalancerClient) ClearListenerSSL(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
+	protocol *string, defaultBackendSet *string) error {
+	effectiveProtocol := protocol
+	if effectiveProtocol == nil || *effectiveProtocol == "" {
+		effectiveProtocol = l.Protocol
+	}
+	if effectiveProtocol != nil && *effectiveProtocol == util.ProtocolHTTP2 {
+		listenerName := "unknown"
+		if l.Name != nil {
+			listenerName = *l.Name
+		}
+		return fmt.Errorf("TLSPolicyUnsupported: cannot clear TLS from HTTP/2 listener %s", listenerName)
+	}
+	return lbc.updateListener(ctx, lbId, etag, l, routingPolicyName, nil, protocol, defaultBackendSet, false)
+}
+
+func (lbc *LoadBalancerClient) updateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
+	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string, preserveExistingSSL bool) error {
+
+	if preserveExistingSSL && sslConfigurationDetails == nil && l.SslConfiguration != nil {
+		var err error
+		sslConfigurationDetails, err = listenerSslConfigurationDetailsFromCurrent(l.SslConfiguration)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -725,11 +812,8 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 		defaultBackendSet = l.DefaultBackendSetName
 	}
 
-	// this is the only cipher suite supported now.
-	if *protocol == util.ProtocolHTTP2 {
-		if sslConfigurationDetails == nil {
-			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", *l.Port)
-		}
+	// This is the HTTP/2 fallback for callers that did not already select an explicit policy.
+	if sslConfigurationDetails != nil && *protocol == util.ProtocolHTTP2 && sslConfigurationDetails.CipherSuiteName == nil {
 		sslConfigurationDetails.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
@@ -797,12 +881,15 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 		return nil
 	}
 
+	// This is the HTTP/2 fallback for callers that did not already select an explicit policy.
 	if listenerProtocol == util.ProtocolHTTP2 {
 		if sslConfig == nil {
 			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", listenerPort)
 		}
 
-		sslConfig.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
+		if sslConfig.CipherSuiteName == nil {
+			sslConfig.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
+		}
 	}
 
 	createListenerRequest := loadbalancer.CreateListenerRequest{
@@ -819,9 +906,12 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 	klog.Infof("Creating listener with request %s", util.PrettyPrint(createListenerRequest))
 	resp, err := lbc.LbClient.CreateListener(ctx, createListenerRequest)
 
-	if util.IsServiceError(err, 409) {
+	if isListenerAlreadyExistsError(err) {
 		klog.Infof("Create listener operation returned code %d for load balancer %s. Listener %s may be already present.", 409, lbID, listenerName)
-		return nil
+		if _, _, refreshErr := lbc.getLoadBalancerBustCache(ctx, lbID); refreshErr != nil {
+			return exception.NewTransientError(fmt.Errorf("listener %s may already be present in load balancer %s, and refresh failed: %w", listenerName, lbID, refreshErr))
+		}
+		return exception.NewTransientError(fmt.Errorf("listener %s may already be present in load balancer %s: %w", listenerName, lbID, err))
 	}
 
 	if err != nil {
@@ -831,6 +921,17 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 	klog.Infof("Create listener response: name: %s, work request id: %s, opc request id: %s.", listenerName, *resp.OpcWorkRequestId, *resp.OpcRequestId)
 	_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
 	return wrapMultiCertificateCapabilityError(err, "CreateListener", common.String(listenerName), sslConfig)
+}
+
+func isListenerAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if util.IsServiceError(err, 409) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "already has listener") || strings.Contains(message, "listener already exists")
 }
 
 func wrapMultiCertificateCapabilityError(err error, operation string, listenerName *string, sslConfigurationDetails *loadbalancer.SslConfigurationDetails) error {
@@ -872,7 +973,9 @@ func (lbc *LoadBalancerClient) waitForWorkRequest(ctx context.Context, workReque
 		}
 
 		if resp.LifecycleState == loadbalancer.WorkRequestLifecycleStateSucceeded {
-			lbc.getLoadBalancerBustCache(ctx, *resp.LoadBalancerId)
+			if _, _, err := lbc.getLoadBalancerBustCache(ctx, *resp.LoadBalancerId); err != nil {
+				klog.Warningf("Unable to refresh load balancer cache after work request %s succeeded: %v", workRequestID, err)
+			}
 			return *resp.LoadBalancerId, nil
 		}
 

@@ -82,6 +82,9 @@ type IngressClassState struct {
 	ListenerProtocolMap             map[int32]string
 	ListenerTLSConfigMap            map[int32]ListenerTLSConfig
 	ListenerDefaultBsMap            map[int32]string
+	// ListenerBackendSetMap includes backend sets reachable through listener defaults,
+	// path rules, and the routing-policy rules derived from those paths.
+	ListenerBackendSetMap map[int32]sets.String
 }
 
 type IngressState struct {
@@ -136,6 +139,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 	listenerProtocolMap := make(map[int32]string)
 	listenerTLSCandidateMap := make(map[int32][]listenerTLSCandidate)
 	listenerDefaultBsMap := make(map[int32]string)
+	listenerBackendSetMap := make(map[int32]sets.String)
 	bsHealthCheckerMap := make(map[string]*ociloadbalancer.HealthCheckerDetails)
 	bsPolicyMap := make(map[string]string)
 	bsSessionPersistenceMap := make(map[string]SessionPersistence)
@@ -193,6 +197,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 				bsName := util.GenerateBackendSetName(ing.Namespace, serviceName, servicePort)
 				desiredBackendSets.Insert(bsName)
 				allBackendSets.Insert(bsName)
+				appendListenerBackendSet(listenerBackendSetMap, listenerPort, bsName)
 
 				err = validateListenerProtocol(ing, listenerProtocolMap, listenerPort)
 				if err != nil {
@@ -203,6 +208,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 				if err != nil {
 					return err
 				}
+				appendListenerBackendSet(listenerBackendSetMap, listenerPort, listenerDefaultBsMap[listenerPort])
 
 				err = validateBackendSetHealthChecker(ing, bsHealthCheckerMap, bsName)
 				if err != nil {
@@ -253,6 +259,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 		ListenerProtocolMap:             listenerProtocolMap,
 		ListenerTLSConfigMap:            listenerTLSConfigMap,
 		ListenerDefaultBsMap:            listenerDefaultBsMap,
+		ListenerBackendSetMap:           listenerBackendSetMap,
 	}
 
 	klog.Infof("Ingress Group state %s, Ingress state %s", util.PrettyPrint(s.IngressGroupState), util.PrettyPrint(s.IngressState))
@@ -486,6 +493,14 @@ func (s *StateStore) GetListenerDefaultBackendSet(listenerPort int32) string {
 	return s.IngressGroupState.ListenerDefaultBsMap[listenerPort]
 }
 
+func (s *StateStore) GetBackendSetsForListener(listenerPort int32) sets.String {
+	backendSets, ok := s.IngressGroupState.ListenerBackendSetMap[listenerPort]
+	if ok {
+		return sets.NewString(backendSets.List()...)
+	}
+	return sets.NewString()
+}
+
 func (s *StateStore) GetTLSConfigForListener(port int32) []TlsConfig {
 	portTLSConfig, ok := s.IngressGroupState.ListenerTLSConfigMap[port]
 	if ok {
@@ -497,12 +512,12 @@ func (s *StateStore) GetTLSConfigForListener(port int32) []TlsConfig {
 	return nil
 }
 
-func (s *StateStore) GetTLSConfigForBackendSet(bsName string) (string, string) {
+func (s *StateStore) GetTLSConfigForBackendSet(bsName string) TlsConfig {
 	bsTLSConfig, ok := s.IngressGroupState.BackendSetTLSConfigMap[bsName]
 	if ok {
-		return bsTLSConfig.Artifact, bsTLSConfig.Type
+		return bsTLSConfig
 	}
-	return "", ""
+	return TlsConfig{}
 }
 
 func (s *StateStore) GetBackendSetSessionPersistence(bsName string) (*ociloadbalancer.SessionPersistenceConfigurationDetails, *ociloadbalancer.LbCookieSessionPersistenceConfigurationDetails) {
@@ -519,6 +534,15 @@ func (s *StateStore) GetAllBackendSetForIngressClass() sets.String {
 
 func (s *StateStore) GetAllListenersForIngressClass() sets.Int32 {
 	return s.IngressGroupState.Listeners
+}
+
+func appendListenerBackendSet(listenerBackendSetMap map[int32]sets.String, listenerPort int32, bsName string) {
+	backendSets, ok := listenerBackendSetMap[listenerPort]
+	if !ok {
+		backendSets = sets.NewString()
+		listenerBackendSetMap[listenerPort] = backendSets
+	}
+	backendSets.Insert(bsName)
 }
 
 func appendListenerTLSCandidate(listenerTLSCandidateMap map[int32][]listenerTLSCandidate, listenerPort int32,

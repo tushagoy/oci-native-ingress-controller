@@ -20,6 +20,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -121,9 +122,10 @@ func TestListenerWithSameSecrets(t *testing.T) {
 	err := stateStore.BuildState(&ingressClassList.Items[0])
 	Expect(err).NotTo(HaveOccurred())
 	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-	Expect(artifact).Should(Equal(secretName))
-	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(backendTLSConfig.Artifact).Should(Equal(secretName))
+	Expect(backendTLSConfig.Type).Should(Equal(ArtifactTypeSecret))
+	Expect(backendTLSConfig.Namespace).Should(Equal("default"))
 
 	listenerTlsConfigs := stateStore.GetTLSConfigForListener(943)
 	Expect(listenerTlsConfigs).Should(Equal([]TlsConfig{{
@@ -261,9 +263,10 @@ func TestListenerWithSingleDirectCertificateConfiguresBackendTLS(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 
 	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-	Expect(artifact).Should(Equal(certificateId))
-	Expect(artifactType).Should(Equal(ArtifactTypeCertificate))
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(backendTLSConfig.Artifact).Should(Equal(certificateId))
+	Expect(backendTLSConfig.Type).Should(Equal(ArtifactTypeCertificate))
+	Expect(backendTLSConfig.Namespace).Should(Equal("default"))
 
 	Expect(stateStore.GetTLSConfigForListener(943)).Should(Equal([]TlsConfig{{
 		Type:      ArtifactTypeCertificate,
@@ -328,9 +331,10 @@ func TestListenerWithMultipleDirectCertificatesConfiguresBackendTLSFromFirstCert
 	Expect(err).NotTo(HaveOccurred())
 
 	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-	Expect(artifact).Should(Equal("certificateA"))
-	Expect(artifactType).Should(Equal(ArtifactTypeCertificate))
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(backendTLSConfig.Artifact).Should(Equal("certificateA"))
+	Expect(backendTLSConfig.Type).Should(Equal(ArtifactTypeCertificate))
+	Expect(backendTLSConfig.Namespace).Should(Equal("default"))
 
 	Expect(stateStore.GetTLSConfigForListener(943)).Should(Equal([]TlsConfig{
 		{
@@ -540,9 +544,10 @@ func TestValidateBackendTlsNoConflictForMixedTLSAndNonTLSHostsSharedBackendSet(t
 	Expect(err).NotTo(HaveOccurred())
 
 	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-	Expect(artifact).Should(Equal(sharedSecretName))
-	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(backendTLSConfig.Artifact).Should(Equal(sharedSecretName))
+	Expect(backendTLSConfig.Type).Should(Equal(ArtifactTypeSecret))
+	Expect(backendTLSConfig.Namespace).Should(Equal("default"))
 }
 
 func TestIngressState(t *testing.T) {
@@ -635,9 +640,10 @@ func assertCases(stateStore *StateStore) {
 	Expect(listenerTlsConfigs).Should(BeNil())
 
 	bsName := util.GenerateBackendSetName("default", "tls-test", 100)
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-	Expect(artifact).Should(Equal(""))
-	Expect(artifactType).Should(Equal(""))
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(backendTLSConfig.Artifact).Should(Equal(""))
+	Expect(backendTLSConfig.Type).Should(Equal(""))
+	Expect(backendTLSConfig.Namespace).Should(Equal(""))
 }
 
 func TestIngressStateNamespaceSafeKeys(t *testing.T) {
@@ -881,38 +887,139 @@ func TestValidateListenerDefaultBackendSetWithConflict(t *testing.T) {
 	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(DefaultBackendSetConflictMessage, 8080)))
 }
 
-// Helper to build a minimal Ingress targeting a service/port with optional annotations
-func makeIngress(name string, annotations map[string]string, svcName string, port int32) networkingv1.Ingress {
+func TestListenerBackendSetParticipationIncludesDefaultAndPathBackendSets(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingress := makeIngressWithPaths("ing-two-services", map[string]string{
+		util.IngressHttpListenerPortAnnotation: "80",
+	},
+		ingressPathSpec{Path: "/app", ServiceName: "svc-a", ServicePort: 8080},
+		ingressPathSpec{Path: "/api", ServiceName: "svc-b", ServicePort: 8081},
+	)
+	ingressList := &networkingv1.IngressList{Items: []networkingv1.Ingress{ingress}}
+
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, &v1.ServiceList{})
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	expectedBackendSets := sets.NewString(
+		util.DefaultBackendSetName,
+		util.GenerateBackendSetName("default", "svc-a", 8080),
+		util.GenerateBackendSetName("default", "svc-b", 8081),
+	)
+	Expect(stateStore.GetListenerDefaultBackendSet(80)).To(Equal(util.DefaultBackendSetName))
+	Expect(stateStore.GetBackendSetsForListener(80).List()).To(Equal(expectedBackendSets.List()))
+}
+
+func TestListenerBackendSetParticipationIncludesMultipleIngressesSharingListener(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	annotations := map[string]string{util.IngressHttpListenerPortAnnotation: "80"}
+	ingressA := makeIngressWithPaths("ing-a", annotations, ingressPathSpec{Path: "/a", ServiceName: "svc-a", ServicePort: 8080})
+	ingressB := makeIngressWithPaths("ing-b", annotations, ingressPathSpec{Path: "/b", ServiceName: "svc-b", ServicePort: 8081})
+	ingressList := &networkingv1.IngressList{Items: []networkingv1.Ingress{ingressB, ingressA}}
+
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, &v1.ServiceList{})
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	expectedBackendSets := sets.NewString(
+		util.DefaultBackendSetName,
+		util.GenerateBackendSetName("default", "svc-a", 8080),
+		util.GenerateBackendSetName("default", "svc-b", 8081),
+	)
+	Expect(stateStore.GetBackendSetsForListener(80).List()).To(Equal(expectedBackendSets.List()))
+}
+
+func TestListenerBackendSetParticipationDedupesRoutingPolicyBackendSetReferences(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingress := makeIngressWithPaths("ing-routing-policy", map[string]string{
+		util.IngressHttpListenerPortAnnotation: "80",
+	},
+		ingressPathSpec{Path: "/", ServiceName: "svc-a", ServicePort: 8080},
+		ingressPathSpec{Path: "/api", ServiceName: "svc-a", ServicePort: 8080},
+	)
+	ingressList := &networkingv1.IngressList{Items: []networkingv1.Ingress{ingress}}
+
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, &v1.ServiceList{})
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	// HTTP routing policies are derived from path rules; two route-policy actions
+	// pointing at the same backend set should still produce one participant.
+	expectedBackendSets := sets.NewString(
+		util.DefaultBackendSetName,
+		util.GenerateBackendSetName("default", "svc-a", 8080),
+	)
+	Expect(stateStore.GetBackendSetsForListener(80).List()).To(Equal(expectedBackendSets.List()))
+}
+
+type ingressPathSpec struct {
+	Path        string
+	ServiceName string
+	ServicePort int32
+}
+
+func makeIngressWithPaths(name string, annotations map[string]string, paths ...ingressPathSpec) networkingv1.Ingress {
 	pathType := networkingv1.PathType("Prefix")
+	ingressAnnotations := map[string]string{}
+	for key, value := range annotations {
+		ingressAnnotations[key] = value
+	}
+
+	httpPaths := make([]networkingv1.HTTPIngressPath, 0, len(paths))
+	for _, path := range paths {
+		httpPaths = append(httpPaths, networkingv1.HTTPIngressPath{
+			Path:     path.Path,
+			PathType: &pathType,
+			Backend: networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{
+					Name: path.ServiceName,
+					Port: networkingv1.ServiceBackendPort{Number: path.ServicePort},
+				},
+			},
+		})
+	}
+
 	return networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
 			Namespace:   "default",
-			Annotations: annotations,
+			Annotations: ingressAnnotations,
 		},
 		Spec: networkingv1.IngressSpec{
 			Rules: []networkingv1.IngressRule{
 				{
 					IngressRuleValue: networkingv1.IngressRuleValue{
 						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: &pathType,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: svcName,
-											Port: networkingv1.ServiceBackendPort{Number: port},
-										},
-									},
-								},
-							},
+							Paths: httpPaths,
 						},
 					},
 				},
 			},
 		},
 	}
+}
+
+// Helper to build a minimal Ingress targeting a service/port with optional annotations
+func makeIngress(name string, annotations map[string]string, svcName string, port int32) networkingv1.Ingress {
+	return makeIngressWithPaths(name, annotations, ingressPathSpec{Path: "/", ServiceName: svcName, ServicePort: port})
 }
 
 func TestValidateSessionPersistence_NoConflict_LbCookie(t *testing.T) {

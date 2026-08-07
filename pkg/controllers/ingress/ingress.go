@@ -402,40 +402,63 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		return err
 	}
 
+	managedMultiCertBackendSets, err := buildManagedMultiCertBackendSets(stateStore, lb, certificateCompartmentId, c, wrapperClient)
+	if err != nil {
+		return err
+	}
+	backendSetsToStage := desiredBackendSets.Union(managedMultiCertBackendSets)
+
 	actualBackendSets := sets.NewString()
+	stagedBackendSetPolicy := false
 	for bsName := range lb.BackendSets {
 		actualBackendSets.Insert(bsName)
 
-		if desiredBackendSets.Has(bsName) {
-			err = syncBackendSet(ctx, ingress, lbId, bsName, stateStore, certificateCompartmentId, c)
+		if backendSetsToStage.Has(bsName) {
+			stagedPolicy, err := syncBackendSet(ctx, ingress, ingressClass.Name, lbId, bsName, stateStore, certificateCompartmentId, c, managedMultiCertBackendSets)
 			if err != nil {
 				return err
 			}
+			stagedBackendSetPolicy = stagedBackendSetPolicy || stagedPolicy
 		}
 	}
 
-	backendSetsToCreate := desiredBackendSets.Difference(actualBackendSets)
+	backendSetsToCreate := backendSetsToStage.Difference(actualBackendSets)
 
 	for _, bsName := range backendSetsToCreate.List() {
 		startBuildTime := util.GetCurrentTimeInUnixMillis()
 		klog.V(2).InfoS("creating backend set for ingress", "ingress", klog.KObj(ingress), "backendSetName", bsName)
-		artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
-		backendSetSslConfig, err := GetSSLConfigForBackendSet(ingress.Namespace, artifactType, artifact, lb, bsName, certificateCompartmentId, c.secretLister, wrapperClient)
+		backendTLSConfig := stateStore.GetTLSConfigForBackendSet(bsName)
+		backendTLSNamespace := backendTLSConfig.Namespace
+		if backendTLSNamespace == "" {
+			backendTLSNamespace = ingress.Namespace
+		}
+		backendSetSslConfig, err := getSSLConfigForBackendSet(backendTLSNamespace, backendTLSConfig.Type, backendTLSConfig.Artifact, lb, bsName, certificateCompartmentId, c.secretLister, wrapperClient, false)
 		if err != nil {
 			return err
 		}
+		backendSetPolicy := selectBackendSetMultiCertTLSPolicy(bsName, backendSetSslConfig, managedMultiCertBackendSets)
+		applyTLSPolicyToSSLConfig(backendSetSslConfig, backendSetPolicy)
 
 		healthChecker := stateStore.GetBackendSetHealthChecker(bsName)
 		policy := stateStore.GetBackendSetPolicy(bsName)
 		appCookie, lbCookie := stateStore.GetBackendSetSessionPersistence(bsName)
 		err = wrapperClient.GetLbClient().CreateBackendSet(context.TODO(), lbId, bsName, policy, healthChecker, backendSetSslConfig, appCookie, lbCookie)
 		if err != nil {
-			return err
+			return wrapBackendSetTLSPolicyStageError(err, ingressClass.Name, bsName, backendSetPolicy, backendSetPolicy != nil)
 		}
+		stagedBackendSetPolicy = stagedBackendSetPolicy || backendSetPolicy != nil
 		endBuildTime := util.GetCurrentTimeInUnixMillis()
 		if c.metricsCollector != nil {
 			c.metricsCollector.AddBackendCreationTime(util.GetTimeDifferenceInSeconds(startBuildTime, endBuildTime))
 		}
+	}
+
+	if stagedBackendSetPolicy {
+		refreshedLb, _, err := wrapperClient.GetLbClient().RefreshLoadBalancer(context.TODO(), lbId)
+		if err != nil {
+			return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s refresh load balancer after backend-set policy staging: %w", ingressClass.Name, err)
+		}
+		lb = refreshedLb
 	}
 
 	// Determine listeners... This is based off path ports.
@@ -457,6 +480,19 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 	for _, port := range toCreate.List() {
 		klog.V(2).InfoS("adding listener for ingress", "ingress", klog.KObj(ingress), "port", port)
 
+		listenerName := util.GenerateListenerName(port)
+		refreshedLb, _, err := wrapperClient.GetLbClient().RefreshLoadBalancer(context.TODO(), lbId)
+		if err != nil {
+			return err
+		}
+		if _, ok := refreshedLb.Listeners[listenerName]; ok {
+			klog.V(2).InfoS("listener already exists while creating, syncing listener instead", "ingress", klog.KObj(ingress), "listenerName", listenerName)
+			if err := syncListener(ctx, stateStore, &lbId, listenerName, certificateCompartmentId, c); err != nil {
+				return err
+			}
+			continue
+		}
+
 		var listenerSslConfig *ociloadbalancer.SslConfigurationDetails
 		listenerTLSConfigs := stateStore.GetTLSConfigForListener(port)
 		listenerSslConfig, err = GetSSLConfigForListener(nil, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient)
@@ -465,6 +501,11 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		}
 
 		protocol := stateStore.GetListenerProtocol(port)
+		listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, listenerSslConfig)
+		if err != nil {
+			return err
+		}
+		applyTLSPolicyToSSLConfig(listenerSslConfig, listenerPolicy)
 		defaultBackendSet := stateStore.GetListenerDefaultBackendSet(port)
 		err = wrapperClient.GetLbClient().CreateListener(context.TODO(), lbId, int(port), protocol, defaultBackendSet, listenerSslConfig)
 		if err != nil {
@@ -566,6 +607,42 @@ func deleteListeners(actualListeners sets.Int32, desiredListeners sets.Int32, lb
 	return nil
 }
 
+func buildManagedMultiCertBackendSets(stateStore *state.StateStore, lb *ociloadbalancer.LoadBalancer, certificateCompartmentId string,
+	c *Controller, wrapperClient *client.WrapperClient) (sets.String, error) {
+	managedBackendSets := sets.NewString()
+	for _, port := range stateStore.GetAllListenersForIngressClass().List() {
+		listenerTLSConfigs := stateStore.GetTLSConfigForListener(port)
+		listenerName := util.GenerateListenerName(port)
+		listener, ok := lb.Listeners[listenerName]
+		var listenerPtr *ociloadbalancer.Listener
+		if ok {
+			listenerPtr = &listener
+		}
+
+		sslConfig, err := getSSLConfigForListener(listenerPtr, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient, false)
+		if err != nil {
+			return nil, err
+		}
+
+		protocol := stateStore.GetListenerProtocol(port)
+		listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, sslConfig)
+		if err != nil {
+			return nil, err
+		}
+		if listenerPolicy == nil && !listenerHasManagedMultiCertTLSPolicy(listenerPtr) {
+			continue
+		}
+
+		backendSets := sets.NewString(stateStore.GetBackendSetsForListener(port).List()...)
+		defaultBackendSet := stateStore.GetListenerDefaultBackendSet(port)
+		if defaultBackendSet != "" {
+			backendSets.Insert(defaultBackendSet)
+		}
+		managedBackendSets = managedBackendSets.Union(backendSets)
+	}
+	return managedBackendSets, nil
+}
+
 func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *string,
 	listenerName string, certificateCompartmentId string, c *Controller) error {
 	startTime := util.GetCurrentTimeInUnixMillis()
@@ -586,22 +663,31 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 	needsUpdate := false
 	listenerTLSConfigs := stateStore.GetTLSConfigForListener(int32(*listener.Port))
 	var sslConfig *ociloadbalancer.SslConfigurationDetails
-	sslConfig, err = GetSSLConfigForListener(&listener, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient)
+	sslConfig, err = getSSLConfigForListener(&listener, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient, false)
 	if err != nil {
 		return err
 	}
 
-	if sslConfig != nil {
-		if listener.SslConfiguration == nil || !reflect.DeepEqual(listener.SslConfiguration.CertificateIds, sslConfig.CertificateIds) {
-			klog.Infof("SSL config for listener update is %s", util.PrettyPrint(sslConfig))
-			needsUpdate = true
-		}
-	} else if listener.SslConfiguration != nil {
-		klog.Infof("SSL config for listener %s needs removal", *listener.Name)
+	protocol := stateStore.GetListenerProtocol(int32(*listener.Port))
+	listenerPolicy, err := selectListenerMultiCertTLSPolicy(protocol, sslConfig)
+	if err != nil {
+		return err
+	}
+	if listenerPolicy != nil {
+		applyTLSPolicyToSSLConfig(sslConfig, listenerPolicy)
+	}
+
+	clearListenerSSL := false
+	if sslConfig == nil && listenerHasSSLArtifacts(listener.SslConfiguration) {
+		klog.Infof("Clearing existing SSL config for listener %s", *listener.Name)
+		clearListenerSSL = true
+	}
+
+	if listenerSslConfigNeedsUpdate(sslConfig, &listener, listenerPolicy != nil) {
+		klog.Infof("SSL config for listener %s needs update, desired config is %s", *listener.Name, util.PrettyPrint(sslConfig))
 		needsUpdate = true
 	}
 
-	protocol := stateStore.GetListenerProtocol(int32(*listener.Port))
 	protocolExisting := listener.Protocol
 	if protocol != "" && (protocolExisting == nil || protocol != *protocolExisting) {
 		klog.Infof("Protocol for listener %d needs update, new protocol %s", *listener.Name, protocol)
@@ -616,7 +702,16 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 	}
 
 	if needsUpdate {
-		err := wrapperClient.GetLbClient().UpdateListener(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, sslConfig, &protocol, &defaultBackendSet, false)
+		if listenerPolicy == nil && sslConfig != nil {
+			if err := preserveListenerTLSPolicy(sslConfig, listener.SslConfiguration); err != nil {
+				return err
+			}
+		}
+		if clearListenerSSL {
+			err = wrapperClient.GetLbClient().ClearListenerSSL(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, &protocol, &defaultBackendSet)
+		} else {
+			err = wrapperClient.GetLbClient().UpdateListener(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, sslConfig, &protocol, &defaultBackendSet)
+		}
 		if err != nil {
 			return err
 		}
@@ -628,32 +723,43 @@ func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *strin
 	return nil
 }
 
-func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, lbID string, backendSetName string,
-	stateStore *state.StateStore, certificateCompartmentId string, c *Controller) error {
+func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, ingressClassName string, lbID string, backendSetName string,
+	stateStore *state.StateStore, certificateCompartmentId string, c *Controller, managedMultiCertBackendSets sets.String) (bool, error) {
 
 	startTime := util.GetCurrentTimeInUnixMillis()
 	wrapperClient, ok := ctx.Value(util.WrapperClient).(*client.WrapperClient)
 	if !ok {
-		return fmt.Errorf(util.OciClientNotFoundInContextError)
+		return false, fmt.Errorf(util.OciClientNotFoundInContextError)
 	}
 	lb, etag, err := wrapperClient.GetLbClient().GetLoadBalancer(context.TODO(), lbID)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	bs, ok := lb.BackendSets[backendSetName]
 	if !ok {
-		return fmt.Errorf("during update, backendset %s was not found", backendSetName)
+		return false, fmt.Errorf("during update, backendset %s was not found", backendSetName)
 	}
 
 	needsUpdate := false
-	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(*bs.Name)
-	sslConfig, err := GetSSLConfigForBackendSet(ingress.Namespace, artifactType, artifact, lb, *bs.Name, certificateCompartmentId, c.secretLister, wrapperClient)
+	stagedBackendSetPolicy := false
+	backendTLSConfig := stateStore.GetTLSConfigForBackendSet(*bs.Name)
+	backendTLSNamespace := backendTLSConfig.Namespace
+	if backendTLSNamespace == "" {
+		backendTLSNamespace = ingress.Namespace
+	}
+	sslConfig, err := getSSLConfigForBackendSet(backendTLSNamespace, backendTLSConfig.Type, backendTLSConfig.Artifact, lb, *bs.Name, certificateCompartmentId, c.secretLister, wrapperClient, false)
 	if err != nil {
-		return err
+		return false, err
+	}
+	backendSetPolicy := selectBackendSetMultiCertTLSPolicy(*bs.Name, sslConfig, managedMultiCertBackendSets)
+	if backendSetPolicy != nil {
+		applyTLSPolicyToSSLConfig(sslConfig, backendSetPolicy)
 	}
 
-	if backendSetSslConfigNeedsUpdate(sslConfig, &bs) {
+	backendSetSSLNeedsUpdate := backendSetSslConfigNeedsUpdate(sslConfig, &bs, backendSetPolicy != nil)
+	stagingManagedMultiCertBackendSet := backendSetSSLNeedsUpdate && managedMultiCertBackendSets.Has(*bs.Name)
+	if backendSetSSLNeedsUpdate {
 		klog.Infof("SSL config for backend set %s update is %s", *bs.Name, util.PrettyPrint(sslConfig))
 		needsUpdate = true
 	}
@@ -689,17 +795,35 @@ func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, lbID str
 	}
 
 	if needsUpdate {
+		if backendSetPolicy == nil && sslConfig != nil {
+			if err := preserveBackendSetTLSPolicy(sslConfig, bs.SslConfiguration); err != nil {
+				return false, err
+			}
+		}
 		err = wrapperClient.GetLbClient().UpdateBackendSetDetails(context.TODO(), *lb.Id, etag, &bs, sslConfig, healthChecker, policy, desiredAppCookie, desiredLbCookie)
 		if err != nil {
-			return err
+			return false, wrapBackendSetTLSPolicyStageError(err, ingressClassName, *bs.Name, backendSetPolicy, stagingManagedMultiCertBackendSet)
 		}
+		stagedBackendSetPolicy = stagingManagedMultiCertBackendSet
 	}
 
 	endTime := util.GetCurrentTimeInUnixMillis()
 	if c.metricsCollector != nil {
 		c.metricsCollector.AddIngressBackendSyncTime(util.GetTimeDifferenceInSeconds(startTime, endTime))
 	}
-	return nil
+	return stagedBackendSetPolicy, nil
+}
+
+func wrapBackendSetTLSPolicyStageError(err error, ingressClassName string, backendSetName string, policy *TLSPolicy, stagingManagedMultiCertBackendSet bool) error {
+	if err == nil || (policy == nil && !stagingManagedMultiCertBackendSet) {
+		return err
+	}
+	if policy == nil {
+		return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s backendSet=%s policy=managed-multi-cert-backend-set action=clear-incompatible-backend-set-ssl: %w",
+			ingressClassName, backendSetName, err)
+	}
+	return fmt.Errorf("TLSPolicyBackendStageFailed: ingressClass=%s backendSet=%s policy=managed-multi-cert-backend-set cipherSuite=%s protocols=%v: %w",
+		ingressClassName, backendSetName, policy.CipherSuiteName, policy.Protocols, err)
 }
 
 func (c *Controller) deleteIngress(i *networkingv1.Ingress) error {

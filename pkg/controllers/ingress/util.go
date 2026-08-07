@@ -155,6 +155,11 @@ func getCertificateNameFromSecret(namespace string, secretName string, secretLis
 
 func GetSSLConfigForBackendSet(namespace string, artifactType string, artifact string, lb *ociloadbalancer.LoadBalancer, bsName string,
 	compartmentId string, secretLister v1.SecretLister, client *client.WrapperClient) (*ociloadbalancer.SslConfigurationDetails, error) {
+	return getSSLConfigForBackendSet(namespace, artifactType, artifact, lb, bsName, compartmentId, secretLister, client, true)
+}
+
+func getSSLConfigForBackendSet(namespace string, artifactType string, artifact string, lb *ociloadbalancer.LoadBalancer, bsName string,
+	compartmentId string, secretLister v1.SecretLister, client *client.WrapperClient, preservePolicy bool) (*ociloadbalancer.SslConfigurationDetails, error) {
 	var backendSetSslConfig *ociloadbalancer.SslConfigurationDetails
 	var caBundleId *string
 
@@ -221,11 +226,21 @@ func GetSSLConfigForBackendSet(namespace string, artifactType string, artifact s
 			}
 		}
 	}
+	if preservePolicy && ok {
+		if err := preserveBackendSetTLSPolicy(backendSetSslConfig, bs.SslConfiguration); err != nil {
+			return nil, err
+		}
+	}
 	return backendSetSslConfig, nil
 }
 
 func GetSSLConfigForListener(listener *ociloadbalancer.Listener, tlsConfigs []state.TlsConfig,
 	compartmentId string, secretLister v1.SecretLister, client *client.WrapperClient) (*ociloadbalancer.SslConfigurationDetails, error) {
+	return getSSLConfigForListener(listener, tlsConfigs, compartmentId, secretLister, client, true)
+}
+
+func getSSLConfigForListener(listener *ociloadbalancer.Listener, tlsConfigs []state.TlsConfig,
+	compartmentId string, secretLister v1.SecretLister, client *client.WrapperClient, preservePolicy bool) (*ociloadbalancer.SslConfigurationDetails, error) {
 	if len(tlsConfigs) == 0 {
 		return nil, nil
 	}
@@ -271,7 +286,13 @@ func GetSSLConfigForListener(listener *ociloadbalancer.Listener, tlsConfigs []st
 		return nil, nil
 	}
 
-	return &ociloadbalancer.SslConfigurationDetails{CertificateIds: certificateIds}, nil
+	sslConfig := &ociloadbalancer.SslConfigurationDetails{CertificateIds: certificateIds}
+	if preservePolicy && listener != nil {
+		if err := preserveListenerTLSPolicy(sslConfig, listener.SslConfiguration); err != nil {
+			return nil, err
+		}
+	}
+	return sslConfig, nil
 }
 
 // ensureCertificateForListener creates/updates a certificate for Listeners, when the artifact is of type secret
@@ -380,13 +401,19 @@ func isTrustAuthorityCaBundle(id string) bool {
 }
 
 func backendSetSslConfigNeedsUpdate(calculatedConfig *ociloadbalancer.SslConfigurationDetails,
-	currentBackendSet *ociloadbalancer.BackendSet) bool {
+	currentBackendSet *ociloadbalancer.BackendSet, comparePolicy bool) bool {
 	if calculatedConfig == nil && currentBackendSet.SslConfiguration != nil {
 		return true
 	}
 
 	if calculatedConfig != nil && (currentBackendSet.SslConfiguration == nil ||
 		!reflect.DeepEqual(currentBackendSet.SslConfiguration.TrustedCertificateAuthorityIds, calculatedConfig.TrustedCertificateAuthorityIds)) {
+		return true
+	}
+
+	if comparePolicy && calculatedConfig != nil && (currentBackendSet.SslConfiguration == nil ||
+		!reflect.DeepEqual(currentBackendSet.SslConfiguration.CipherSuiteName, calculatedConfig.CipherSuiteName) ||
+		!tlsProtocolsEqual(currentBackendSet.SslConfiguration.Protocols, calculatedConfig.Protocols)) {
 		return true
 	}
 

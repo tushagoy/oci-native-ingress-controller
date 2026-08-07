@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"bitbucket.oci.oraclecorp.com/oke/oci-native-ingress-controller/pkg/exception"
 	. "github.com/onsi/gomega"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
@@ -34,6 +35,28 @@ func (e badRequestServiceError) GetCode() string {
 }
 
 func (e badRequestServiceError) GetOpcRequestID() string {
+	return "fake-opc-request-id"
+}
+
+type conflictServiceError struct{}
+
+func (e conflictServiceError) Error() string {
+	return "Conflict: already has listener 'route_8080'"
+}
+
+func (e conflictServiceError) GetHTTPStatusCode() int {
+	return 409
+}
+
+func (e conflictServiceError) GetMessage() string {
+	return "already has listener 'route_8080'"
+}
+
+func (e conflictServiceError) GetCode() string {
+	return "Conflict"
+}
+
+func (e conflictServiceError) GetOpcRequestID() string {
 	return "fake-opc-request-id"
 }
 
@@ -114,7 +137,23 @@ func TestLoadBalancerClient_CreateListener_PreservesMultiCertificateIds(t *testi
 	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP, util.DefaultBackendSetName, &sslConfigDetail)
 	Expect(err).To(BeNil())
 	Expect(capturedCreateListenerRequest).ToNot(BeNil())
-	Expect(capturedCreateListenerRequest.CreateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+	Expect(capturedCreateListenerRequest.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+}
+
+func TestLoadBalancerClient_CreateListener_PassesDesiredTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateListenerRequest = nil
+
+	sslConfigDetail := getSslConfigurationDetails("id")
+	sslConfigDetail.CipherSuiteName = common.String("desired-listener-cipher")
+	sslConfigDetail.Protocols = []string{"TLSv1.2", "TLSv1.3"}
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP, util.DefaultBackendSetName, &sslConfigDetail)
+	Expect(err).To(BeNil())
+	Expect(capturedCreateListenerRequest).ToNot(BeNil())
+	sslConfig := capturedCreateListenerRequest.SslConfiguration
+	Expect(*sslConfig.CipherSuiteName).To(Equal("desired-listener-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
 func TestLoadBalancerClient_CreateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
@@ -132,6 +171,22 @@ func TestLoadBalancerClient_CreateListener_WrapsUnsupportedCapabilityErrorsForMu
 	Expect(err.Error()).To(Equal(multiCertificateCapabilityErrorMessage))
 	var capabilityErr *multiCertificateCapabilityError
 	Expect(errors.As(err, &capabilityErr)).To(BeTrue())
+}
+
+func TestLoadBalancerClient_CreateListenerAlreadyExistsIsTransient(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	mockCreateListenerErr = conflictServiceError{}
+	defer func() {
+		mockCreateListenerErr = nil
+	}()
+
+	sslConfigDetail := getSslConfigurationDetails("id")
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8080, util.ProtocolHTTP, util.DefaultBackendSetName, &sslConfigDetail)
+
+	Expect(err).To(HaveOccurred())
+	Expect(exception.HasTransientError(err)).To(BeTrue())
+	Expect(err.Error()).To(ContainSubstring("may already be present"))
 }
 
 func getSslConfigurationDetails(id string) ociloadbalancer.SslConfigurationDetails {
@@ -171,6 +226,43 @@ func TestLoadBalancerClient_UpdateBackends(t *testing.T) {
 
 }
 
+func TestLoadBalancerClient_UpdateBackends_PreservesBackendSetTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+	mockLoadBalancerResponseMutator = func(res *ociloadbalancer.GetLoadBalancerResponse) {
+		backendSet := res.BackendSets["bs_f151df96ee98ff0"]
+		backendSet.SslConfiguration = &ociloadbalancer.SslConfiguration{
+			TrustedCertificateAuthorityIds: []string{"ca-existing"},
+			CertificateIds:                 []string{"listener-cert"},
+			CertificateName:                common.String("legacy-cert-name"),
+			CipherSuiteName:                common.String("existing-backend-cipher"),
+			Protocols:                      []string{"TLSv1.2"},
+		}
+		res.BackendSets["bs_f151df96ee98ff0"] = backendSet
+	}
+	defer func() {
+		mockLoadBalancerResponseMutator = nil
+	}()
+
+	ip := "127.0.0.29"
+	port := 8080
+	backends := []ociloadbalancer.BackendDetails{{
+		IpAddress: &ip,
+		Port:      &port,
+	}}
+
+	err := loadBalancerClient.UpdateBackends(context.TODO(), "id", "bs_f151df96ee98ff0", backends)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
+	sslConfig := capturedUpdateBackendSetRequest.SslConfiguration
+	Expect(sslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-existing"}))
+	Expect(sslConfig.CertificateIds).To(BeNil())
+	Expect(sslConfig.CertificateName).To(BeNil())
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-backend-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+}
+
 func TestLoadBalancerClient_UpdateBackendSetDetails(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -189,6 +281,83 @@ func TestLoadBalancerClient_UpdateBackendSetDetails(t *testing.T) {
 	err := loadBalancerClient.UpdateBackendSetDetails(context.TODO(), lbId, etag, &bs, &sslConfigDetails,
 		&healthCheckerDetails, policy, nil, nil)
 	Expect(err).To(BeNil())
+}
+
+func TestLoadBalancerClient_UpdateBackendSetDetails_PreservesBackendSetTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+
+	lbId := "id"
+	etag := "etag"
+	policy := "policy"
+	bsName := util.GenerateBackendSetName("default", "testecho1", 80)
+
+	lb := util.SampleLoadBalancerResponse()
+	bs := lb.BackendSets[bsName]
+	bs.SslConfiguration = &ociloadbalancer.SslConfiguration{
+		TrustedCertificateAuthorityIds: []string{"ca-current"},
+		CipherSuiteName:                common.String("existing-backend-cipher"),
+		Protocols:                      []string{"TLSv1.2"},
+	}
+	sslConfigDetails := ociloadbalancer.SslConfigurationDetails{TrustedCertificateAuthorityIds: []string{"ca-desired"}}
+	healthCheckerDetails := ociloadbalancer.HealthCheckerDetails{}
+
+	err := loadBalancerClient.UpdateBackendSetDetails(context.TODO(), lbId, etag, &bs, &sslConfigDetails,
+		&healthCheckerDetails, policy, nil, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
+	sslConfig := capturedUpdateBackendSetRequest.SslConfiguration
+	Expect(sslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-desired"}))
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-backend-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+}
+
+func TestLoadBalancerClient_UpdateBackendSetDetails_AllowsIntentionalBackendTLSDisable(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+
+	lbId := "id"
+	etag := "etag"
+	policy := "policy"
+	bsName := util.GenerateBackendSetName("default", "testecho1", 80)
+
+	lb := util.SampleLoadBalancerResponse()
+	bs := lb.BackendSets[bsName]
+	bs.SslConfiguration = &ociloadbalancer.SslConfiguration{
+		TrustedCertificateAuthorityIds: []string{"ca-current"},
+		CipherSuiteName:                common.String("existing-backend-cipher"),
+		Protocols:                      []string{"TLSv1.2"},
+	}
+	healthCheckerDetails := ociloadbalancer.HealthCheckerDetails{}
+
+	err := loadBalancerClient.UpdateBackendSetDetails(context.TODO(), lbId, etag, &bs, nil,
+		&healthCheckerDetails, policy, nil, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
+	Expect(capturedUpdateBackendSetRequest.SslConfiguration).To(BeNil())
+}
+
+func TestBackendSetSslConfigurationDetailsFromCurrentUsesAllowlist(t *testing.T) {
+	RegisterTestingT(t)
+
+	current := &ociloadbalancer.SslConfiguration{
+		TrustedCertificateAuthorityIds: []string{"ca-a"},
+		CertificateIds:                 []string{"listener-cert"},
+		CertificateName:                common.String("legacy-cert-name"),
+		CipherSuiteName:                common.String("existing-cipher"),
+		Protocols:                      []string{"TLSv1.2"},
+	}
+
+	sslConfig, err := backendSetSslConfigurationDetailsFromCurrent(current)
+
+	Expect(err).NotTo(HaveOccurred())
+	Expect(sslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-a"}))
+	Expect(sslConfig.CertificateIds).To(BeNil())
+	Expect(sslConfig.CertificateName).To(BeNil())
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
 }
 
 func TestLoadBalancerClient_DeleteBackendSet(t *testing.T) {
@@ -236,6 +405,44 @@ func TestLoadBalancerClient_CreateBackendSet(t *testing.T) {
 	Expect(err).To(Not(BeNil()))
 }
 
+func TestLoadBalancerClient_CreateBackendSet_PassesDesiredTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateBackendSetRequest = nil
+
+	sslConfig := ociloadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: []string{"ca-desired"},
+		CipherSuiteName:                common.String("desired-backend-cipher"),
+		Protocols:                      []string{"TLSv1.2"},
+	}
+	err := loadBalancerClient.CreateBackendSet(context.TODO(), "id", "new-backend-set", "policy", nil, &sslConfig, nil, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedCreateBackendSetRequest).ToNot(BeNil())
+	capturedSslConfig := capturedCreateBackendSetRequest.SslConfiguration
+	Expect(capturedSslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-desired"}))
+	Expect(*capturedSslConfig.CipherSuiteName).To(Equal("desired-backend-cipher"))
+	Expect(capturedSslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+}
+
+func TestLoadBalancerClient_UpdateBackendSet_PassesDesiredTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+
+	sslConfig := ociloadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: []string{"ca-desired"},
+		CipherSuiteName:                common.String("desired-backend-cipher"),
+		Protocols:                      []string{"TLSv1.2"},
+	}
+	err := loadBalancerClient.UpdateBackendSet(context.TODO(), "id", "etag", "backend-set", "policy", nil, &sslConfig, nil, nil, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
+	capturedSslConfig := capturedUpdateBackendSetRequest.SslConfiguration
+	Expect(capturedSslConfig.TrustedCertificateAuthorityIds).To(Equal([]string{"ca-desired"}))
+	Expect(*capturedSslConfig.CipherSuiteName).To(Equal("desired-backend-cipher"))
+	Expect(capturedSslConfig.Protocols).To(Equal([]string{"TLSv1.2"}))
+}
+
 func TestLoadBalancerClient_UpdateListener(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -251,9 +458,9 @@ func TestLoadBalancerClient_UpdateListener(t *testing.T) {
 		RoutingPolicyName: &pname,
 	}
 	ssConfig := getSslConfigurationDetails(id)
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil, true)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil)
 	Expect(err).To(BeNil())
-	err = loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto2, nil, true)
+	err = loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto2, nil)
 	Expect(err).To(BeNil())
 }
 
@@ -280,7 +487,7 @@ func TestLoadBalancerClient_UpdateListenerPreservesExistingSSLWhenRequested(t *t
 		},
 	}
 
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, nil, nil, &proto, &defaultBackendSet, true)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, nil, nil, &proto, &defaultBackendSet)
 	Expect(err).To(BeNil())
 	Expect(mockClient.updateListenerRequest).ToNot(BeNil())
 	sslConfig := mockClient.updateListenerRequest.UpdateListenerDetails.SslConfiguration
@@ -311,7 +518,7 @@ func TestLoadBalancerClient_UpdateListenerClearsSSLWhenNotPreserved(t *testing.T
 		},
 	}
 
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, nil, nil, &proto, &defaultBackendSet, false)
+	err := loadBalancerClient.ClearListenerSSL(context.TODO(), &id, "", listener, nil, &proto, &defaultBackendSet)
 
 	Expect(err).To(BeNil())
 	Expect(mockClient.updateListenerRequest).ToNot(BeNil())
@@ -332,13 +539,166 @@ func TestLoadBalancerClient_UpdateListener_PreservesExistingMultiCertificateIdsW
 		Port:     &port,
 		Protocol: &proto,
 		SslConfiguration: &ociloadbalancer.SslConfiguration{
-			CertificateIds: []string{"cert-a", "cert-b"},
+			CertificateIds:  []string{"cert-a", "cert-b"},
+			CertificateName: common.String("legacy-cert-name"),
+			CipherSuiteName: common.String("existing-cipher"),
+			Protocols:       []string{"TLSv1.3", "TLSv1.2"},
 		},
 	}
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, nil, &proto, nil, true)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, nil, &proto, nil)
 	Expect(err).To(BeNil())
 	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
-	Expect(capturedUpdateListenerRequest.UpdateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	sslConfig := capturedUpdateListenerRequest.SslConfiguration
+	Expect(sslConfig.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	Expect(sslConfig.CertificateName).To(BeNil())
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.3", "TLSv1.2"}))
+}
+
+func TestLoadBalancerClient_ClearListenerSSLDoesNotPreserveExistingSSL(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds:  []string{"cert-a", "cert-b"},
+			CipherSuiteName: common.String("existing-cipher"),
+			Protocols:       []string{"TLSv1.3", "TLSv1.2"},
+		},
+	}
+
+	err := loadBalancerClient.ClearListenerSSL(context.TODO(), &id, "", listener, &pname, &proto, nil)
+
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(capturedUpdateListenerRequest.SslConfiguration).To(BeNil())
+}
+
+func TestLoadBalancerClient_ClearListenerSSLRejectsHTTP2(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP2
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds: []string{"cert-a"},
+		},
+	}
+
+	err := loadBalancerClient.ClearListenerSSL(context.TODO(), &id, "", listener, &pname, nil, nil)
+
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("TLSPolicyUnsupported"))
+	Expect(capturedUpdateListenerRequest).To(BeNil())
+}
+
+func TestLoadBalancerClient_EnsureRoutingPolicy_PreservesListenerSSLPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+	mockLoadBalancerResponseMutator = func(res *ociloadbalancer.GetLoadBalancerResponse) {
+		listener := res.Listeners["route_80"]
+		listener.RoutingPolicyName = nil
+		listener.SslConfiguration = &ociloadbalancer.SslConfiguration{
+			CertificateIds:  []string{"cert-a", "cert-b"},
+			CertificateName: common.String("legacy-cert-name"),
+			CipherSuiteName: common.String("existing-listener-cipher"),
+			Protocols:       []string{"TLSv1.2", "TLSv1.3"},
+		}
+		res.Listeners["route_80"] = listener
+	}
+	defer func() {
+		mockLoadBalancerResponseMutator = nil
+	}()
+
+	condition := "cond"
+	rules := []ociloadbalancer.RoutingRule{{
+		Name:      common.String("route_80"),
+		Condition: &condition,
+		Actions:   nil,
+	}}
+
+	err := loadBalancerClient.EnsureRoutingPolicy(context.TODO(), "id", "route_80", rules)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(*capturedUpdateListenerRequest.RoutingPolicyName).To(Equal("route_80"))
+	sslConfig := capturedUpdateListenerRequest.SslConfiguration
+	Expect(sslConfig.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	Expect(sslConfig.CertificateName).To(BeNil())
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-listener-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestLoadBalancerClient_UpdateListenerDetachRoutingPolicy_PreservesListenerSSLPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds:  []string{"cert-a", "cert-b"},
+			CertificateName: common.String("legacy-cert-name"),
+			CipherSuiteName: common.String("existing-listener-cipher"),
+			Protocols:       []string{"TLSv1.2", "TLSv1.3"},
+		},
+	}
+
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, nil, nil, &proto, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(capturedUpdateListenerRequest.RoutingPolicyName).To(BeNil())
+	sslConfig := capturedUpdateListenerRequest.SslConfiguration
+	Expect(sslConfig.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+	Expect(sslConfig.CertificateName).To(BeNil())
+	Expect(*sslConfig.CipherSuiteName).To(Equal("existing-listener-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestLoadBalancerClient_UpdateListenerRejectsNonRequestablePreservedCipherSuite(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds:  []string{"cert-a"},
+			CipherSuiteName: common.String(ociCustomizedCipherSuiteName),
+			Protocols:       []string{"TLSv1.2"},
+		},
+	}
+
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, nil, &proto, nil)
+
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("TLSPolicyPreserveFailed"))
 }
 
 func TestLoadBalancerClient_UpdateListener_PreservesDesiredMultiCertificateIds(t *testing.T) {
@@ -357,10 +717,71 @@ func TestLoadBalancerClient_UpdateListener_PreservesDesiredMultiCertificateIds(t
 	}
 	ssConfig := getSslConfigurationDetails(id)
 	ssConfig.CertificateIds = []string{"cert-1", "cert-2", "cert-3"}
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil, true)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil)
 	Expect(err).To(BeNil())
 	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
-	Expect(capturedUpdateListenerRequest.UpdateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+	Expect(capturedUpdateListenerRequest.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+}
+
+func TestLoadBalancerClient_UpdateListener_PassesDesiredTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+	}
+	ssConfig := getSslConfigurationDetails(id)
+	ssConfig.CipherSuiteName = common.String("desired-listener-cipher")
+	ssConfig.Protocols = []string{"TLSv1.2", "TLSv1.3"}
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	sslConfig := capturedUpdateListenerRequest.SslConfiguration
+	Expect(*sslConfig.CipherSuiteName).To(Equal("desired-listener-cipher"))
+	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestLoadBalancerClient_HTTP2DefaultDoesNotOverrideExplicitTLSPolicy(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateListenerRequest = nil
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP2
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+	}
+	createSslConfig := getSslConfigurationDetails(id)
+	createSslConfig.CertificateIds = []string{"cert-a"}
+	createSslConfig.CipherSuiteName = common.String("planner-cipher")
+	createSslConfig.Protocols = []string{"TLSv1.2"}
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP2, util.DefaultBackendSetName, &createSslConfig)
+	Expect(err).To(BeNil())
+	Expect(capturedCreateListenerRequest).ToNot(BeNil())
+	Expect(*capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("planner-cipher"))
+	Expect(capturedCreateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2"}))
+
+	updateSslConfig := getSslConfigurationDetails(id)
+	updateSslConfig.CertificateIds = []string{"cert-a"}
+	updateSslConfig.CipherSuiteName = common.String("planner-cipher")
+	updateSslConfig.Protocols = []string{"TLSv1.2"}
+	err = loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &updateSslConfig, &proto, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("planner-cipher"))
+	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2"}))
 }
 
 func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
@@ -383,7 +804,7 @@ func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMu
 	ssConfig := getSslConfigurationDetails(id)
 	ssConfig.CertificateIds = []string{"cert-1", "cert-2"}
 
-	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil, true)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil)
 	Expect(err).ToNot(BeNil())
 	Expect(err.Error()).To(Equal(multiCertificateCapabilityErrorMessage))
 	var capabilityErr *multiCertificateCapabilityError
@@ -413,10 +834,12 @@ func GetLoadBalancerClient() client.LoadBalancerInterface {
 	return &MockLoadBalancerClient{}
 }
 
-var cachedSAs map[string]map[string]interface{}
+var capturedCreateBackendSetRequest *ociloadbalancer.CreateBackendSetRequest
 var capturedCreateListenerRequest *ociloadbalancer.CreateListenerRequest
+var capturedUpdateBackendSetRequest *ociloadbalancer.UpdateBackendSetRequest
 var capturedUpdateListenerRequest *ociloadbalancer.UpdateListenerRequest
 var mockCreateListenerErr error
+var mockLoadBalancerResponseMutator func(*ociloadbalancer.GetLoadBalancerResponse)
 var mockUpdateListenerErr error
 
 type MockLoadBalancerClient struct {
@@ -441,6 +864,9 @@ func (m MockLoadBalancerClient) UpdateNetworkSecurityGroups(ctx context.Context,
 
 func (m MockLoadBalancerClient) GetLoadBalancer(ctx context.Context, request ociloadbalancer.GetLoadBalancerRequest) (ociloadbalancer.GetLoadBalancerResponse, error) {
 	res := util.SampleLoadBalancerResponse()
+	if mockLoadBalancerResponseMutator != nil {
+		mockLoadBalancerResponseMutator(&res)
+	}
 	return res, nil
 }
 
@@ -480,6 +906,8 @@ func (m MockLoadBalancerClient) GetWorkRequest(ctx context.Context, request ocil
 }
 
 func (m MockLoadBalancerClient) CreateBackendSet(ctx context.Context, request ociloadbalancer.CreateBackendSetRequest) (ociloadbalancer.CreateBackendSetResponse, error) {
+	copied := request
+	capturedCreateBackendSetRequest = &copied
 	id := "id"
 	var err error
 	if *request.Name == "error" {
@@ -493,6 +921,8 @@ func (m MockLoadBalancerClient) CreateBackendSet(ctx context.Context, request oc
 }
 
 func (m MockLoadBalancerClient) UpdateBackendSet(ctx context.Context, request ociloadbalancer.UpdateBackendSetRequest) (ociloadbalancer.UpdateBackendSetResponse, error) {
+	copied := request
+	capturedUpdateBackendSetRequest = &copied
 	id := "id"
 	return ociloadbalancer.UpdateBackendSetResponse{
 		RawResponse:      nil,
