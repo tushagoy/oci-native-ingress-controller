@@ -15,10 +15,10 @@ import (
 	"sort"
 	"strings"
 
-	"bitbucket.oci.oraclecorp.com/oke/oci-native-ingress-controller/pkg/tlspolicy"
-	"bitbucket.oci.oraclecorp.com/oke/oci-native-ingress-controller/pkg/util"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
+	"github.com/oracle/oci-native-ingress-controller/pkg/tlspolicy"
+	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 )
 
 type tlsPolicyResourceType string

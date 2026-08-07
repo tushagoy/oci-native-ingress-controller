@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
-	"bitbucket.oci.oraclecorp.com/oke/oci-native-ingress-controller/pkg/exception"
 	. "github.com/onsi/gomega"
 	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"

@@ -6,7 +6,7 @@
 #
 
 # For open source
-FROM golang:1.23.7-alpine as builder
+FROM golang:1.26.5-alpine as builder
 
 WORKDIR /workspace
 
@@ -18,7 +18,7 @@ COPY . ./
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
 #RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager main.go
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GO111MODULE=on go build -mod vendor -a -o dist/onic ./main.go
+RUN GODEBUG=fips140=off CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} GO111MODULE=on go build -mod vendor -a -o dist/onic ./main.go
 
 # For Open source
 FROM oraclelinux:8-slim
@@ -26,6 +26,8 @@ FROM oraclelinux:8-slim
 LABEL author="OKE Foundations Team"
 
 WORKDIR /usr/local/bin/oci-native-ingress-controller
+
+ENV GODEBUG=fips140=off
 
 # copy license files
 COPY LICENSE.txt .

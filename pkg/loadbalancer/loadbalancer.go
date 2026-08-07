@@ -715,7 +715,7 @@ func (lbc *LoadBalancerClient) setRoutingPolicyOnListener(
 		return exception.NewTransientError(fmt.Errorf("listener %s not found", routingPolicyName))
 	}
 
-	return lbc.UpdateListener(ctx, lb.Id, etag, l, &routingPolicyName, nil, l.Protocol, nil, true)
+	return lbc.UpdateListener(ctx, lb.Id, etag, l, &routingPolicyName, nil, l.Protocol, nil)
 }
 
 func listenerSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
