@@ -157,7 +157,10 @@ func initsWithCustomLBAndServicesSecretsAndCertManager(ctx context.Context, ingr
 		ingressInformer, saInformer, serviceLister, secretInformer, fakeClient, nil, nil, false, fakeRecorder)
 }
 
-func drainControllerQueue(c *Controller) {
+func drainControllerQueue(c *Controller, initialIngressCount int) {
+	Eventually(func() int {
+		return c.queue.Len()
+	}).Should(Equal(initialIngressCount))
 	for c.queue.Len() > 0 {
 		item, shutdown := c.queue.Get()
 		if shutdown {
@@ -1814,7 +1817,7 @@ func TestIngressAdd(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPath)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	ingress := ingressList.Items[0].DeepCopy()
 	ingress.Name = "ingress-add-unique"
 	queueSize := c.queue.Len()
@@ -1829,11 +1832,11 @@ func TestIngressUpdate(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	oldIngress := ingressList.Items[0].DeepCopy()
 	newIngress := ingressList.Items[1].DeepCopy()
-	oldIngress.Name = "ingress-update-old-unique"
-	newIngress.Name = "ingress-update-new-unique"
+	oldIngress.Name = "ingress-update-unique"
+	newIngress.Name = oldIngress.Name
 	queueSize := c.queue.Len()
 	c.ingressUpdate(&ingressList.Items[0], &ingressList.Items[1])
 	Expect(c.queue.Len()).Should(Equal(queueSize))
@@ -1850,7 +1853,7 @@ func TestIngressDelete(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	ingress := ingressList.Items[0].DeepCopy()
 	ingress.Name = "ingress-delete-unique"
 	queueSize := c.queue.Len()
@@ -1865,9 +1868,9 @@ func TestSecretAdd(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	queueSize := c.queue.Len()
-	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}}, false)
+	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: "default"}}, false)
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
 }
 
@@ -1878,9 +1881,9 @@ func TestSecretAdd_IsInInitialList(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	queueSize := c.queue.Len()
-	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}}, true)
+	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: "default"}}, true)
 	Expect(c.queue.Len()).Should(Equal(queueSize))
 }
 
@@ -1891,9 +1894,9 @@ func TestSecretUpdate(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	queueSize := c.queue.Len()
-	c.secretUpdate(nil, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}})
+	c.secretUpdate(nil, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: "default"}})
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
 }
 
@@ -1905,7 +1908,7 @@ func TestProcessNextItem(t *testing.T) {
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
 
-	drainControllerQueue(c)
+	drainControllerQueue(c, len(ingressList.Items))
 	c.queue.Add("default-ingress-class")
 	res := c.processNextItem()
 	Expect(res).Should(BeTrue())
