@@ -783,12 +783,12 @@ func (lbc *LoadBalancerClient) ClearListenerSSL(ctx context.Context, lbId *strin
 	if effectiveProtocol == nil || *effectiveProtocol == "" {
 		effectiveProtocol = l.Protocol
 	}
-	if effectiveProtocol != nil && *effectiveProtocol == util.ProtocolHTTP2 {
+	if effectiveProtocol != nil && util.IsListenerProtocolTLSRequired(*effectiveProtocol) {
 		listenerName := "unknown"
 		if l.Name != nil {
 			listenerName = *l.Name
 		}
-		return fmt.Errorf("TLSPolicyUnsupported: cannot clear TLS from HTTP/2 listener %s", listenerName)
+		return fmt.Errorf("TLSPolicyUnsupported: cannot clear TLS from %s listener %s", *effectiveProtocol, listenerName)
 	}
 	return lbc.updateListener(ctx, lbId, etag, l, routingPolicyName, nil, protocol, defaultBackendSet, false)
 }
@@ -812,8 +812,8 @@ func (lbc *LoadBalancerClient) updateListener(ctx context.Context, lbId *string,
 		defaultBackendSet = l.DefaultBackendSetName
 	}
 
-	// This is the HTTP/2 fallback for callers that did not already select an explicit policy.
-	if sslConfigurationDetails != nil && *protocol == util.ProtocolHTTP2 && sslConfigurationDetails.CipherSuiteName == nil {
+	// This is the HTTP/2-family fallback for callers that did not already select an explicit policy.
+	if sslConfigurationDetails != nil && util.IsListenerProtocolUsingHTTP2CipherSuite(*protocol) && sslConfigurationDetails.CipherSuiteName == nil {
 		sslConfigurationDetails.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
@@ -881,10 +881,10 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 		return nil
 	}
 
-	// This is the HTTP/2 fallback for callers that did not already select an explicit policy.
-	if listenerProtocol == util.ProtocolHTTP2 {
+	// This is the HTTP/2-family fallback for callers that did not already select an explicit policy.
+	if util.IsListenerProtocolTLSRequired(listenerProtocol) {
 		if sslConfig == nil {
-			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", listenerPort)
+			return fmt.Errorf("no TLS configuration provided for a %s listener at port %d", listenerProtocol, listenerPort)
 		}
 
 		if sslConfig.CipherSuiteName == nil {

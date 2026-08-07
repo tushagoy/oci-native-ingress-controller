@@ -64,8 +64,7 @@ const (
 	IngressListenerTlsCertificateAnnotation = "oci-native-ingress.oraclecloud.com/certificate-ocid"
 	IngressBackendTlsEnabledAnnotation      = "oci-native-ingress.oraclecloud.com/backend-tls-enabled"
 
-	// IngressProtocolAnntoation - HTTP only for now
-	// HTTP, HTTP2, TCP - accepted.
+	// IngressProtocolAnnotation - HTTP, HTTP2, GRPC, TCP are accepted.
 	IngressProtocolAnnotation = "oci-native-ingress.oraclecloud.com/protocol"
 
 	IngressPolicyAnnotation                       = "oci-native-ingress.oraclecloud.com/policy"
@@ -100,6 +99,7 @@ const (
 	ProtocolTCP                            = "TCP"
 	ProtocolHTTP                           = "HTTP"
 	ProtocolHTTP2                          = "HTTP2"
+	ProtocolGRPC                           = "GRPC"
 	ProtocolHTTP2DefaultCipherSuite        = "oci-default-http2-ssl-cipher-suite-v1"
 	DefaultBackendSetName                  = "default_ingress"
 	DefaultHealthCheckProtocol             = ProtocolTCP
@@ -1030,7 +1030,15 @@ func IsIngressProtocolTCP(ingress *networkingv1.Ingress) bool {
 
 func IsIngressProtocolHTTPBased(ingress *networkingv1.Ingress) bool {
 	protocol := GetIngressProtocol(ingress)
-	return protocol == ProtocolHTTP || protocol == ProtocolHTTP2
+	return protocol == ProtocolHTTP || protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
+}
+
+func IsListenerProtocolTLSRequired(protocol string) bool {
+	return protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
+}
+
+func IsListenerProtocolUsingHTTP2CipherSuite(protocol string) bool {
+	return protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
 }
 
 // StringSlicesHaveSameElements checks if s1 and s2 have the same elements, ignoring order and duplicates.

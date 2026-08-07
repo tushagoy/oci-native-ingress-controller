@@ -796,6 +796,27 @@ func TestValidateProtocolConfig(t *testing.T) {
 	Expect(actualProtocol).Should(Equal("HTTP2"))
 }
 
+func TestValidateGRPCProtocolConfig(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ingressClassList := util.GetIngressClassList()
+
+	ingressList := util.ReadResourceAsIngressList(ListenerProtocolConfigValidationsFilePath)
+	ingressList.Items[0].Annotations[util.IngressProtocolAnnotation] = "grpc"
+	ingressList.Items[1].Annotations[util.IngressProtocolAnnotation] = util.ProtocolGRPC
+
+	testService := util.GetServiceListResource("default", "test-protocol-annotation", 900)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	actualProtocol := stateStore.GetListenerProtocol(900)
+	Expect(actualProtocol).Should(Equal(util.ProtocolGRPC))
+}
+
 func TestValidateProtocolConfigWithConflict(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())

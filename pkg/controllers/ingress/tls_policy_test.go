@@ -59,6 +59,17 @@ func TestSelectListenerMultiCertTLSPolicySupportsHTTP2(t *testing.T) {
 	Expect(policy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
+func TestSelectListenerMultiCertTLSPolicySupportsGRPC(t *testing.T) {
+	RegisterTestingT(t)
+
+	sslConfig := &ociloadbalancer.SslConfigurationDetails{CertificateIds: []string{"cert-a", "cert-b"}}
+	policy, err := selectListenerMultiCertTLSPolicy(util.ProtocolGRPC, sslConfig)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(policy).NotTo(BeNil())
+	Expect(policy.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
+	Expect(policy.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
 func TestSelectBackendSetMultiCertTLSPolicy(t *testing.T) {
 	RegisterTestingT(t)
 

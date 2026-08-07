@@ -468,7 +468,7 @@ We can configure HTTPS-enabled ingress routes using Kubernetes TLS secrets, OCI 
 - In tenancies or regions where OCI LB multi-certificate listeners are not enabled, NIC surfaces an actionable reconcile error and warning event and does not fall back to a multi-listener workaround.
 
 ##### Multi-certificate listener TLS policy
-When this feature is available in the target release path and tenancy or region, NIC configures HTTP and HTTP/2 frontend listeners with multiple certificates by using the OCI LB managed listener TLS policy:
+When this feature is available in the target release path and tenancy or region, NIC configures HTTP, HTTP/2, and gRPC frontend listeners with multiple certificates by using the OCI LB managed listener TLS policy:
 
 ```yaml
 cipherSuiteName: oci-tls-12-13-ssl-cipher-suite-v3
@@ -486,6 +486,16 @@ metadata:
   annotations:
     oci-native-ingress.oraclecloud.com/protocol: HTTP2
 ```
+
+gRPC frontend listeners can be requested with:
+
+```yaml
+metadata:
+  annotations:
+    oci-native-ingress.oraclecloud.com/protocol: GRPC
+```
+
+gRPC listeners require listener TLS configuration, so configure `spec.tls` or `oci-native-ingress.oraclecloud.com/certificate-ocid` on the Ingress. Backend TLS remains enabled by default.
 
 ##### Sample configuration : Using Secret
 We create OCI certificate service certificates and cabundles for each kubernetes secret. Hence the content of the secret (ca.crt, tls.crt, tls.key) should conform to the certificate service standards.
@@ -738,7 +748,7 @@ All changes to those modules should be reflected in the remote VCS repository.
 
 ### Known Issues
 1. The loadbalancer has a limitation of 16 backend sets per load balancer. We create a backend set for every unique service and port combination. So if a customer has more such services they need to have new load balancers.
-2. Each service port is mapped to one load balancer listener. Listener SSL configuration can include multiple certificates (from multiple `spec.tls` secrets and/or comma-separated direct certificate OCIDs). In this feature path, HTTP and HTTP/2 multi-certificate listeners use `oci-tls-12-13-ssl-cipher-suite-v3` with `TLSv1.2` and `TLSv1.3`. In tenancies or regions where OCI LB multi-certificate listener capability is not enabled, multi-certificate requests are rejected by OCI LB and surfaced by NIC as actionable reconcile errors and warning events.
+2. Each service port is mapped to one load balancer listener. Listener SSL configuration can include multiple certificates (from multiple `spec.tls` secrets and/or comma-separated direct certificate OCIDs). In this feature path, HTTP, HTTP/2, and gRPC multi-certificate listeners use `oci-tls-12-13-ssl-cipher-suite-v3` with `TLSv1.2` and `TLSv1.3`. In tenancies or regions where OCI LB multi-certificate listener capability is not enabled, multi-certificate requests are rejected by OCI LB and surfaced by NIC as actionable reconcile errors and warning events.
 3. Any conflicting declarations for same backend set health checker and routing policy across ingress resources will throw a validation error which will be logged in controller logs.
 4. For supporting ssl through kubernetes secrets, we generate respective certificates and ca bundles in certificate service. If we delete ingress resource, currently we only delete the load balancer resources.
 The certificates need to be cleared by the customer.

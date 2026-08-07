@@ -390,11 +390,32 @@ func TestIsIngressProtocolHTTPBased(t *testing.T) {
 	i.Annotations[IngressProtocolAnnotation] = ProtocolHTTP2
 	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
 
+	i.Annotations[IngressProtocolAnnotation] = ProtocolGRPC
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
 	i.Annotations[IngressProtocolAnnotation] = ProtocolTCP
 	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeFalse())
 
 	i.Annotations = nil
 	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+}
+
+func TestIsListenerProtocolTLSRequired(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(IsListenerProtocolTLSRequired(ProtocolHTTP)).Should(BeFalse())
+	Expect(IsListenerProtocolTLSRequired(ProtocolTCP)).Should(BeFalse())
+	Expect(IsListenerProtocolTLSRequired(ProtocolHTTP2)).Should(BeTrue())
+	Expect(IsListenerProtocolTLSRequired(ProtocolGRPC)).Should(BeTrue())
+}
+
+func TestIsListenerProtocolUsingHTTP2CipherSuite(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolHTTP)).Should(BeFalse())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolTCP)).Should(BeFalse())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolHTTP2)).Should(BeTrue())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolGRPC)).Should(BeTrue())
 }
 
 func TestGetBackendTlsEnabled(t *testing.T) {

@@ -469,6 +469,30 @@ func TestEnsureIngress_UpdateHTTP2ListenerWithMultipleCertificateIds(t *testing.
 	Expect(updateDetails.SslConfiguration.Protocols).Should(Equal(DefaultMultiCertTLSPolicy.Listener.Protocols))
 }
 
+func TestEnsureIngress_UpdateGRPCListener(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA")
+	ingressList.Items[0].Annotations[util.IngressProtocolAnnotation] = util.ProtocolGRPC
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingProtocol:       util.ProtocolHTTP,
+		ExistingCertificateIDs: []string{"certA"},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(1))
+	updateDetails := capturingLB.UpdateListenerRequests[0].UpdateListenerDetails
+	Expect(*updateDetails.Protocol).Should(Equal(util.ProtocolGRPC))
+	Expect(updateDetails.SslConfiguration.CertificateIds).Should(Equal([]string{"certA"}))
+	Expect(*updateDetails.SslConfiguration.CipherSuiteName).Should(Equal(util.ProtocolHTTP2DefaultCipherSuite))
+}
+
 func TestEnsureIngress_HTTP2ListenerNoopWhenMultiCertPolicyMatches(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -977,6 +1001,29 @@ func TestEnsureIngress_CreateHTTP2ListenerWithMultipleCertificateIds(t *testing.
 	Expect(*createDetails.SslConfiguration.CipherSuiteName).Should(Equal(DefaultMultiCertTLSPolicy.Listener.CipherSuiteName))
 	Expect(createDetails.SslConfiguration.Protocols).Should(Equal(DefaultMultiCertTLSPolicy.Listener.Protocols))
 	expectBackendSetRequestsWithoutSSLConfig(capturingLB)
+}
+
+func TestEnsureIngress_CreateGRPCListener(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA")
+	ingressList.Items[0].Annotations[util.IngressProtocolAnnotation] = util.ProtocolGRPC
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort: 443,
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.CreateListenerRequests)).Should(Equal(1))
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(0))
+	createDetails := capturingLB.CreateListenerRequests[0].CreateListenerDetails
+	Expect(*createDetails.Protocol).Should(Equal(util.ProtocolGRPC))
+	Expect(createDetails.SslConfiguration.CertificateIds).Should(Equal([]string{"certA"}))
+	Expect(*createDetails.SslConfiguration.CipherSuiteName).Should(Equal(util.ProtocolHTTP2DefaultCipherSuite))
 }
 
 func TestEnsureIngress_UpdateListenerClearsSSLWhenDesiredSslConfigAbsent(t *testing.T) {

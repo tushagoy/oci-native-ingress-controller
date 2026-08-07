@@ -156,6 +156,30 @@ func TestLoadBalancerClient_CreateListener_PassesDesiredTLSPolicy(t *testing.T) 
 	Expect(sslConfig.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
 }
 
+func TestLoadBalancerClient_CreateGRPCListenerRequiresTLS(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateListenerRequest = nil
+
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolGRPC, util.DefaultBackendSetName, nil)
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("no TLS configuration provided for a GRPC listener"))
+	Expect(capturedCreateListenerRequest).To(BeNil())
+}
+
+func TestLoadBalancerClient_CreateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateListenerRequest = nil
+
+	sslConfigDetail := getSslConfigurationDetails("id")
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolGRPC, util.DefaultBackendSetName, &sslConfigDetail)
+	Expect(err).To(BeNil())
+	Expect(capturedCreateListenerRequest).ToNot(BeNil())
+	Expect(*capturedCreateListenerRequest.Protocol).To(Equal(util.ProtocolGRPC))
+	Expect(*capturedCreateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal(util.ProtocolHTTP2DefaultCipherSuite))
+}
+
 func TestLoadBalancerClient_CreateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -607,6 +631,31 @@ func TestLoadBalancerClient_ClearListenerSSLRejectsHTTP2(t *testing.T) {
 	Expect(capturedUpdateListenerRequest).To(BeNil())
 }
 
+func TestLoadBalancerClient_ClearListenerSSLRejectsGRPC(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolGRPC
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds: []string{"cert-a"},
+		},
+	}
+
+	err := loadBalancerClient.ClearListenerSSL(context.TODO(), &id, "", listener, &pname, nil, nil)
+
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(ContainSubstring("TLSPolicyUnsupported"))
+	Expect(capturedUpdateListenerRequest).To(BeNil())
+}
+
 func TestLoadBalancerClient_EnsureRoutingPolicy_PreservesListenerSSLPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -784,6 +833,28 @@ func TestLoadBalancerClient_HTTP2DefaultDoesNotOverrideExplicitTLSPolicy(t *test
 	Expect(capturedUpdateListenerRequest.SslConfiguration.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
 	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal("oci-tls-12-13-ssl-cipher-suite-v3"))
 	Expect(capturedUpdateListenerRequest.SslConfiguration.Protocols).To(Equal([]string{"TLSv1.2", "TLSv1.3"}))
+}
+
+func TestLoadBalancerClient_UpdateGRPCListenerAppliesHTTP2DefaultCipherSuite(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolGRPC
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+	}
+	sslConfig := getSslConfigurationDetails(id)
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &sslConfig, &proto, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(*capturedUpdateListenerRequest.Protocol).To(Equal(util.ProtocolGRPC))
+	Expect(*capturedUpdateListenerRequest.SslConfiguration.CipherSuiteName).To(Equal(util.ProtocolHTTP2DefaultCipherSuite))
 }
 
 func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
