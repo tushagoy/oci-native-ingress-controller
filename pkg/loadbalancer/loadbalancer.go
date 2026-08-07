@@ -40,6 +40,20 @@ type LoadBalancerClient struct {
 	Cache map[string]*LbCacheObj
 }
 
+const multiCertificateCapabilityErrorMessage = "OCI Load Balancer multi-certificate listeners may not be supported in this tenancy or region; verify enablement or use one certificate"
+
+type multiCertificateCapabilityError struct {
+	cause error
+}
+
+func (e *multiCertificateCapabilityError) Error() string {
+	return multiCertificateCapabilityErrorMessage
+}
+
+func (e *multiCertificateCapabilityError) Unwrap() error {
+	return e.cause
+}
+
 func New(lbClient *loadbalancer.LoadBalancerClient) *LoadBalancerClient {
 	return &LoadBalancerClient{
 		LbClient: client.NewLoadBalancerClient(lbClient),
@@ -711,6 +725,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 		defaultBackendSet = l.DefaultBackendSetName
 	}
 
+	// this is the only cipher suite supported now.
 	if *protocol == util.ProtocolHTTP2 {
 		if sslConfigurationDetails == nil {
 			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", *l.Port)
@@ -741,7 +756,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 	}
 
 	if err != nil {
-		return err
+		return wrapMultiCertificateCapabilityError(err, "UpdateListener", l.Name, sslConfigurationDetails)
 	}
 
 	// Safe logging without nil deref
@@ -760,7 +775,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 	klog.Infof("Update listener response: name: %s, work request id: %s, opc request id: %s.", lname, wrID, opcID)
 	if resp.OpcWorkRequestId != nil {
 		_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
-		return err
+		return wrapMultiCertificateCapabilityError(err, "UpdateListener", l.Name, sslConfigurationDetails)
 	}
 	// If mock or backend didn't return a work request id, treat as completed.
 	return nil
@@ -810,12 +825,38 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 	}
 
 	if err != nil {
-		return err
+		return wrapMultiCertificateCapabilityError(err, "CreateListener", common.String(listenerName), sslConfig)
 	}
 
 	klog.Infof("Create listener response: name: %s, work request id: %s, opc request id: %s.", listenerName, *resp.OpcWorkRequestId, *resp.OpcRequestId)
 	_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
-	return err
+	return wrapMultiCertificateCapabilityError(err, "CreateListener", common.String(listenerName), sslConfig)
+}
+
+func wrapMultiCertificateCapabilityError(err error, operation string, listenerName *string, sslConfigurationDetails *loadbalancer.SslConfigurationDetails) error {
+	if err == nil || sslConfigurationDetails == nil || len(sslConfigurationDetails.CertificateIds) <= 1 {
+		return err
+	}
+
+	svcErr, hasServiceError := common.IsServiceError(err)
+	isCandidateCapabilityError := strings.Contains(err.Error(), "work request failed")
+	if hasServiceError {
+		statusCode := svcErr.GetHTTPStatusCode()
+		isCandidateCapabilityError = isCandidateCapabilityError || statusCode == 400 || statusCode == 403 || statusCode == 422
+	}
+
+	if !isCandidateCapabilityError {
+		return err
+	}
+
+	resolvedListenerName := "unknown"
+	if listenerName != nil && *listenerName != "" {
+		resolvedListenerName = *listenerName
+	}
+
+	klog.Warningf("%s failed for listener %s with %d certificates; OCI LB multi-cert capability may be unavailable: %v",
+		operation, resolvedListenerName, len(sslConfigurationDetails.CertificateIds), err)
+	return &multiCertificateCapabilityError{cause: err}
 }
 
 func (lbc *LoadBalancerClient) waitForWorkRequest(ctx context.Context, workRequestID string) (string, error) {

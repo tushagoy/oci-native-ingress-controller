@@ -304,22 +304,47 @@ func TestGetIngressClassLoadBalancerId(t *testing.T) {
 	Expect(result).Should(Equal(""))
 }
 
-func TestGetListenerTlsCertificateOcid(t *testing.T) {
+func TestGetListenerTlsCertificateOcids(t *testing.T) {
 	RegisterTestingT(t)
-	certOcid := "certOcid"
 	i := networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{IngressListenerTlsCertificateAnnotation: certOcid},
+			Annotations: map[string]string{
+				IngressListenerTlsCertificateAnnotation: " certA , certB,certA,, certC , ",
+			},
 		},
 	}
 
-	result := GetListenerTlsCertificateOcid(&i)
-	Expect(*result).Should(Equal(certOcid))
+	result := GetListenerTlsCertificateOcids(&i)
+	Expect(result).Should(Equal([]string{"certA", "certB", "certC"}))
+
+	i.Annotations = map[string]string{
+		IngressListenerTlsCertificateAnnotation: "   ,  ",
+	}
+	result = GetListenerTlsCertificateOcids(&i)
+	Expect(len(result)).Should(Equal(0))
 
 	i.Annotations = nil
+	result = GetListenerTlsCertificateOcids(&i)
+	Expect(result).Should(BeNil())
+}
 
-	result = GetListenerTlsCertificateOcid(&i)
-	Expect(result).To(BeNil())
+func TestIsIngressProtocolHTTPBased(t *testing.T) {
+	RegisterTestingT(t)
+	i := networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressProtocolAnnotation: ProtocolHTTP},
+		},
+	}
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
+	i.Annotations[IngressProtocolAnnotation] = ProtocolHTTP2
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
+	i.Annotations[IngressProtocolAnnotation] = ProtocolTCP
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeFalse())
+
+	i.Annotations = nil
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
 }
 
 func TestGetBackendTlsEnabled(t *testing.T) {
@@ -848,7 +873,7 @@ func TestDetermineListenerPort(t *testing.T) {
 	Expect(listenerPort).Should(Equal(httpsPort))
 
 	delete(annotations, IngressHttpsListenerPortAnnotation)
-	annotations[IngressListenerTlsCertificateAnnotation] = "oci_cert"
+	annotations[IngressListenerTlsCertificateAnnotation] = "oci_cert_1, oci_cert_2,oci_cert_1"
 	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(listenerPort).Should(Equal(servicePort))
@@ -857,6 +882,12 @@ func TestDetermineListenerPort(t *testing.T) {
 	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(listenerPort).Should(Equal(httpsPort))
+
+	annotations[IngressListenerTlsCertificateAnnotation] = " , "
+	delete(annotations, IngressHttpsListenerPortAnnotation)
+	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(listenerPort).Should(Equal(httpPort))
 }
 
 func TestIsBackendServiceEqual(t *testing.T) {

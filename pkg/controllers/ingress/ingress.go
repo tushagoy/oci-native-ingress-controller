@@ -386,9 +386,9 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		return ingressConfigError
 	}
 
-	desiredPorts := stateStore.GetIngressPorts(ingress.Name)
+	desiredPorts := stateStore.GetIngressPorts(ingress.Namespace, ingress.Name)
 
-	desiredBackendSets := stateStore.GetIngressBackendSets(ingress.Name)
+	desiredBackendSets := stateStore.GetIngressBackendSets(ingress.Namespace, ingress.Name)
 
 	lbId := util.GetIngressClassLoadBalancerId(ingressClass)
 
@@ -445,7 +445,7 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		actualListenerPorts.Insert(listenerPort)
 
 		if desiredPorts.Has(listenerPort) {
-			err := syncListener(ctx, ingress.Namespace, stateStore, &lbId, *listener.Name, certificateCompartmentId, c)
+			err := syncListener(ctx, stateStore, &lbId, *listener.Name, certificateCompartmentId, c)
 			if err != nil {
 				return err
 			}
@@ -458,8 +458,8 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		klog.V(2).InfoS("adding listener for ingress", "ingress", klog.KObj(ingress), "port", port)
 
 		var listenerSslConfig *ociloadbalancer.SslConfigurationDetails
-		artifact, artifactType := stateStore.GetTLSConfigForListener(port)
-		listenerSslConfig, err := GetSSLConfigForListener(ingress.Namespace, nil, artifactType, artifact, certificateCompartmentId, c.secretLister, wrapperClient)
+		listenerTLSConfigs := stateStore.GetTLSConfigForListener(port)
+		listenerSslConfig, err = GetSSLConfigForListener(nil, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient)
 		if err != nil {
 			return err
 		}
@@ -566,7 +566,7 @@ func deleteListeners(actualListeners sets.Int32, desiredListeners sets.Int32, lb
 	return nil
 }
 
-func syncListener(ctx context.Context, namespace string, stateStore *state.StateStore, lbId *string,
+func syncListener(ctx context.Context, stateStore *state.StateStore, lbId *string,
 	listenerName string, certificateCompartmentId string, c *Controller) error {
 	startTime := util.GetCurrentTimeInUnixMillis()
 	wrapperClient, ok := ctx.Value(util.WrapperClient).(*client.WrapperClient)
@@ -584,19 +584,17 @@ func syncListener(ctx context.Context, namespace string, stateStore *state.State
 	}
 
 	needsUpdate := false
-	artifact, artifactType := stateStore.GetTLSConfigForListener(int32(*listener.Port))
+	listenerTLSConfigs := stateStore.GetTLSConfigForListener(int32(*listener.Port))
 	var sslConfig *ociloadbalancer.SslConfigurationDetails
-	if artifact != "" {
-		sslConfig, err = GetSSLConfigForListener(namespace, &listener, artifactType, artifact, certificateCompartmentId, c.secretLister, wrapperClient)
-		if err != nil {
-			return err
-		}
+	sslConfig, err = GetSSLConfigForListener(&listener, listenerTLSConfigs, certificateCompartmentId, c.secretLister, wrapperClient)
+	if err != nil {
+		return err
+	}
 
-		if sslConfig != nil {
-			if listener.SslConfiguration == nil || !reflect.DeepEqual(listener.SslConfiguration.CertificateIds, sslConfig.CertificateIds) {
-				klog.Infof("SSL config for listener update is %s", util.PrettyPrint(sslConfig))
-				needsUpdate = true
-			}
+	if sslConfig != nil {
+		if listener.SslConfiguration == nil || !reflect.DeepEqual(listener.SslConfiguration.CertificateIds, sslConfig.CertificateIds) {
+			klog.Infof("SSL config for listener update is %s", util.PrettyPrint(sslConfig))
+			needsUpdate = true
 		}
 	} else if listener.SslConfiguration != nil {
 		klog.Infof("SSL config for listener %s needs removal", *listener.Name)

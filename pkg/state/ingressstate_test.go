@@ -64,6 +64,13 @@ func setUp(ctx context.Context, ingressClassList *networkingv1.IngressClassList,
 	return ingressClassLister, ingressLister, serviceLister
 }
 
+func setBackendTLSEnabled(ingress *networkingv1.Ingress, enabled bool) {
+	if ingress.Annotations == nil {
+		ingress.Annotations = map[string]string{}
+	}
+	ingress.Annotations[util.IngressBackendTlsEnabledAnnotation] = fmt.Sprintf("%t", enabled)
+}
+
 func TestListenerWithDifferentSecrets(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,13 +79,26 @@ func TestListenerWithDifferentSecrets(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 
 	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	setBackendTLSEnabled(&ingressList.Items[0], false)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
 	testService := util.GetServiceListResource("default", "tls-test", 943)
 	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
 
 	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
 	err := stateStore.BuildState(&ingressClassList.Items[0])
-	Expect(err).NotTo(BeNil())
-	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(PortConflictMessage, 943)))
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerTlsConfigs := stateStore.GetTLSConfigForListener(943)
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeSecret,
+		Artifact:  "secret_name_one",
+		Namespace: "default",
+	}))
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeSecret,
+		Artifact:  "secret_name_two",
+		Namespace: "default",
+	}))
 }
 
 func TestListenerWithSameSecrets(t *testing.T) {
@@ -105,9 +125,12 @@ func TestListenerWithSameSecrets(t *testing.T) {
 	Expect(artifact).Should(Equal(secretName))
 	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
 
-	artifact, artifactType = stateStore.GetTLSConfigForListener(943)
-	Expect(artifact).Should(Equal(secretName))
-	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
+	listenerTlsConfigs := stateStore.GetTLSConfigForListener(943)
+	Expect(listenerTlsConfigs).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeSecret,
+		Artifact:  secretName,
+		Namespace: "default",
+	}}))
 
 	allBs := stateStore.GetAllBackendSetForIngressClass()
 	Expect(len(allBs)).Should(Equal(2))
@@ -121,18 +144,30 @@ func TestListenerWithSecretAndCertificate(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 
 	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	setBackendTLSEnabled(&ingressList.Items[0], false)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
 
 	ingressList.Items[1].Spec.TLS = []networkingv1.IngressTLS{}
-	ingressList.Items[1].Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: "certificateId"}
+	ingressList.Items[1].Annotations[util.IngressListenerTlsCertificateAnnotation] = "certificateId"
 
 	testService := util.GetServiceListResource("default", "tls-test", 943)
 	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
 
 	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
 	err := stateStore.BuildState(&ingressClassList.Items[0])
-	fmt.Printf("FATAL: %+v\n", err)
-	Expect(err).NotTo(BeNil())
-	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(PortConflictMessage, 943)))
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerTlsConfigs := stateStore.GetTLSConfigForListener(943)
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeSecret,
+		Artifact:  "secret_name_one",
+		Namespace: "default",
+	}))
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  "certificateId",
+		Namespace: "default",
+	}))
 }
 
 func TestListenerWithDifferentCertificates(t *testing.T) {
@@ -143,21 +178,99 @@ func TestListenerWithDifferentCertificates(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 
 	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	setBackendTLSEnabled(&ingressList.Items[0], false)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
 
 	ingressList.Items[0].Spec.TLS = []networkingv1.IngressTLS{}
-	ingressList.Items[0].Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: "certificateId"}
+	ingressList.Items[0].Annotations[util.IngressListenerTlsCertificateAnnotation] = "certificateId"
 	ingressList.Items[1].Spec.TLS = []networkingv1.IngressTLS{}
-	ingressList.Items[1].Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: "differentCertificateId"}
+	ingressList.Items[1].Annotations[util.IngressListenerTlsCertificateAnnotation] = "differentCertificateId"
 
 	testService := util.GetServiceListResource("default", "tls-test", 943)
 	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
 
 	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
 	err := stateStore.BuildState(&ingressClassList.Items[0])
-	Expect(err).NotTo(BeNil())
-	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(PortConflictMessage, 943)))
+	Expect(err).NotTo(HaveOccurred())
+
+	listenerTlsConfigs := stateStore.GetTLSConfigForListener(943)
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  "certificateId",
+		Namespace: "default",
+	}))
+	Expect(listenerTlsConfigs).Should(ContainElement(TlsConfig{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  "differentCertificateId",
+		Namespace: "default",
+	}))
 }
 
+func TestSslTerminationAtLB(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+
+	ingressList := util.ReadResourceAsIngressList(TestSslTerminationAtLb)
+
+	certificateId := "certificateId"
+	ingressList.Items[0].Spec.TLS = []networkingv1.IngressTLS{}
+	ingressList.Items[0].Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: certificateId}
+
+	testService := util.GetServiceListResource("default", "tls-test", 443)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 443)
+	bsTlsConfig := stateStore.IngressGroupState.BackendSetTLSConfigMap[bsName]
+	Expect(bsTlsConfig.Artifact).Should(Equal(""))
+	Expect(bsTlsConfig.Type).Should(Equal(""))
+
+	lstTlsConfig := stateStore.IngressGroupState.ListenerTLSConfigMap[443]
+	Expect(lstTlsConfig.TlsConfigs).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  certificateId,
+		Namespace: "",
+	}}))
+}
+
+func TestListenerWithSingleDirectCertificateConfiguresBackendTLS(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+
+	certificateId := "certificateId"
+	ingress := ingressList.Items[0]
+	ingress.Spec.TLS = []networkingv1.IngressTLS{}
+	ingress.Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: certificateId}
+	ingressList = &networkingv1.IngressList{Items: []networkingv1.Ingress{ingress}}
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(artifact).Should(Equal(certificateId))
+	Expect(artifactType).Should(Equal(ArtifactTypeCertificate))
+
+	Expect(stateStore.GetTLSConfigForListener(943)).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  certificateId,
+		Namespace: "default",
+	}}))
+}
 func TestListenerWithSameCertificate(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -187,8 +300,249 @@ func TestListenerWithSameCertificate(t *testing.T) {
 	Expect(bsTlsConfig.Type).Should(Equal(ArtifactTypeCertificate))
 
 	lstTlsConfig := stateStore.IngressGroupState.ListenerTLSConfigMap[943]
-	Expect(lstTlsConfig.Artifact).Should(Equal(certificateId))
-	Expect(lstTlsConfig.Type).Should(Equal(ArtifactTypeCertificate))
+	Expect(lstTlsConfig.TlsConfigs).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeCertificate,
+		Artifact:  certificateId,
+		Namespace: "default",
+	}}))
+}
+
+func TestListenerWithMultipleDirectCertificatesConfiguresBackendTLSFromFirstCertificate(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+
+	ingress := ingressList.Items[0]
+	ingress.Spec.TLS = []networkingv1.IngressTLS{}
+	ingress.Annotations = map[string]string{util.IngressListenerTlsCertificateAnnotation: "certificateA, certificateB, certificateA"}
+	ingressList = &networkingv1.IngressList{Items: []networkingv1.Ingress{ingress}}
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(artifact).Should(Equal("certificateA"))
+	Expect(artifactType).Should(Equal(ArtifactTypeCertificate))
+
+	Expect(stateStore.GetTLSConfigForListener(943)).Should(Equal([]TlsConfig{
+		{
+			Type:      ArtifactTypeCertificate,
+			Artifact:  "certificateA",
+			Namespace: "default",
+		},
+		{
+			Type:      ArtifactTypeCertificate,
+			Artifact:  "certificateB",
+			Namespace: "default",
+		},
+	}))
+}
+
+func TestListenerTLSAggregationDeterministicOrderingAndDedupe(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	ingressList.Items[0], ingressList.Items[1] = ingressList.Items[1], ingressList.Items[0]
+
+	setBackendTLSEnabled(&ingressList.Items[0], false)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
+	ingressList.Items[0].Annotations[util.IngressListenerTlsCertificateAnnotation] = "certificateA,certificateC"
+	ingressList.Items[1].Annotations[util.IngressListenerTlsCertificateAnnotation] = "certificateB,certificateA,certificateB"
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect(stateStore.GetTLSConfigForListener(943)).Should(Equal([]TlsConfig{
+		{
+			Type:      ArtifactTypeCertificate,
+			Artifact:  "certificateB",
+			Namespace: "default",
+		},
+		{
+			Type:      ArtifactTypeCertificate,
+			Artifact:  "certificateA",
+			Namespace: "default",
+		},
+		{
+			Type:      ArtifactTypeSecret,
+			Artifact:  "secret_name_one",
+			Namespace: "default",
+		},
+		{
+			Type:      ArtifactTypeCertificate,
+			Artifact:  "certificateC",
+			Namespace: "default",
+		},
+		{
+			Type:      ArtifactTypeSecret,
+			Artifact:  "secret_name_two",
+			Namespace: "default",
+		},
+	}))
+}
+
+func TestValidateBackendTlsConflictWithMixedEnabledValues(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+
+	sharedSecretName := "shared_secret_name"
+	ingressList.Items[0].Spec.TLS[0].SecretName = sharedSecretName
+	ingressList.Items[1].Spec.TLS[0].SecretName = sharedSecretName
+	setBackendTLSEnabled(&ingressList.Items[0], true)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).Should(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(BackendTlsEnabledConflictMessage, bsName)))
+}
+
+func TestValidateBackendTlsConflictWithMixedEnabledValuesAndNoBackendTLSInput(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+
+	ingressList.Items[0].Spec.TLS = nil
+	setBackendTLSEnabled(&ingressList.Items[0], true)
+	setBackendTLSEnabled(&ingressList.Items[1], false)
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).Should(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(BackendTlsEnabledConflictMessage, bsName)))
+}
+
+func TestValidateBackendTlsConflictWithDifferentArtifacts(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	setBackendTLSEnabled(&ingressList.Items[0], true)
+	setBackendTLSEnabled(&ingressList.Items[1], true)
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).Should(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(BackendTlsArtifactConflictMessage, bsName)))
+}
+
+func TestValidateBackendTlsNoConflictForMixedTLSAndNonTLSHostsSharedBackendSet(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	pathType := networkingv1.PathTypePrefix
+	sharedSecretName := "shared_secret_name"
+	ingress := networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mixed-host-shared-backend-set",
+			Namespace: "default",
+			Annotations: map[string]string{
+				util.IngressBackendTlsEnabledAnnotation: "true",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			TLS: []networkingv1.IngressTLS{
+				{
+					Hosts:      []string{"secure.foo.bar.com"},
+					SecretName: sharedSecretName,
+				},
+			},
+			Rules: []networkingv1.IngressRule{
+				{
+					Host: "plain.foo.bar.com",
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									PathType: &pathType,
+									Path:     "/plain",
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: "tls-test",
+											Port: networkingv1.ServiceBackendPort{Number: 943},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Host: "secure.foo.bar.com",
+					IngressRuleValue: networkingv1.IngressRuleValue{
+						HTTP: &networkingv1.HTTPIngressRuleValue{
+							Paths: []networkingv1.HTTPIngressPath{
+								{
+									PathType: &pathType,
+									Path:     "/secure",
+									Backend: networkingv1.IngressBackend{
+										Service: &networkingv1.IngressServiceBackend{
+											Name: "tls-test",
+											Port: networkingv1.ServiceBackendPort{Number: 943},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ingressList := &networkingv1.IngressList{Items: []networkingv1.Ingress{ingress}}
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+
+	bsName := util.GenerateBackendSetName("default", "tls-test", 943)
+	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
+	Expect(artifact).Should(Equal(sharedSecretName))
+	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
 }
 
 func TestIngressState(t *testing.T) {
@@ -254,31 +608,66 @@ func assertCases(stateStore *StateStore) {
 	// 4 including default_ingress
 	Expect(len(allBs)).Should(Equal(5))
 
-	ingressBs := stateStore.GetIngressBackendSets(ingressName)
+	ingressBs := stateStore.GetIngressBackendSets("default", ingressName)
 	Expect(len(ingressBs)).Should(Equal(3))
 
-	ingressListeners := stateStore.GetIngressPorts(ingressName)
+	ingressListeners := stateStore.GetIngressPorts("default", ingressName)
 	Expect(len(ingressListeners)).Should(Equal(2))
 
 	Expect(len(stateStore.IngressGroupState.BackendSetTLSConfigMap)).Should(Equal(3))
 	Expect(len(stateStore.IngressGroupState.ListenerTLSConfigMap)).Should(Equal(3))
 
-	artifact, artifactType := stateStore.GetTLSConfigForListener(80)
-	Expect(artifact).Should(Equal("secret_name"))
-	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
+	listenerTlsConfigs := stateStore.GetTLSConfigForListener(80)
+	Expect(listenerTlsConfigs).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeSecret,
+		Artifact:  "secret_name",
+		Namespace: "default",
+	}}))
 
-	artifact, artifactType = stateStore.GetTLSConfigForListener(90)
-	Expect(artifact).Should(Equal("secret_name"))
-	Expect(artifactType).Should(Equal(ArtifactTypeSecret))
+	listenerTlsConfigs = stateStore.GetTLSConfigForListener(90)
+	Expect(listenerTlsConfigs).Should(Equal([]TlsConfig{{
+		Type:      ArtifactTypeSecret,
+		Artifact:  "secret_name",
+		Namespace: "default",
+	}}))
 
-	artifact, artifactType = stateStore.GetTLSConfigForListener(100)
-	Expect(artifact).Should(Equal(""))
-	Expect(artifactType).Should(Equal(""))
+	listenerTlsConfigs = stateStore.GetTLSConfigForListener(100)
+	Expect(listenerTlsConfigs).Should(BeNil())
 
 	bsName := util.GenerateBackendSetName("default", "tls-test", 100)
-	artifact, artifactType = stateStore.GetTLSConfigForBackendSet(bsName)
+	artifact, artifactType := stateStore.GetTLSConfigForBackendSet(bsName)
 	Expect(artifact).Should(Equal(""))
 	Expect(artifactType).Should(Equal(""))
+}
+
+func TestIngressStateNamespaceSafeKeys(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+
+	// Two ingresses with same name in different namespaces should not collide in desired state.
+	ingressList.Items[1].Name = ingressList.Items[0].Name
+	ingressList.Items[1].Namespace = "other"
+
+	defaultServices := util.GetServiceListResource("default", "tls-test", 943)
+	otherServices := util.GetServiceListResource("other", "tls-test", 943)
+	testService := &v1.ServiceList{Items: append(defaultServices.Items, otherServices.Items...)}
+
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(stateStore.IngressState)).Should(Equal(2))
+
+	defaultIngressPorts := stateStore.GetIngressPorts("default", ingressList.Items[0].Name)
+	Expect(defaultIngressPorts).ShouldNot(BeNil())
+
+	otherIngressPorts := stateStore.GetIngressPorts("other", ingressList.Items[0].Name)
+	Expect(otherIngressPorts).ShouldNot(BeNil())
 }
 
 func TestValidateHealthCheckerConfig(t *testing.T) {

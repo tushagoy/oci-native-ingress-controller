@@ -2,11 +2,13 @@ package ingress
 
 import (
 	"context"
+	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/tools/events"
 	"sync"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -31,6 +33,7 @@ const (
 	ingressPath              = "ingressPath.yaml"
 	ingressPathWithFinalizer = "ingressPathWithFinalizer.yaml"
 	ingressPathWithTlsSecret = "ingressPathWithTlsSecret.yaml"
+	multiCertificateWarning  = "OCI Load Balancer multi-certificate listeners may not be supported in this tenancy or region; verify enablement or use one certificate"
 )
 
 func setUp(ctx context.Context, ingressClassList *networkingv1.IngressClassList, ingressList *networkingv1.IngressList, testService *v1.ServiceList) (networkinginformers.IngressClassInformer, networkinginformers.IngressInformer, coreinformers.ServiceAccountInformer, corelisters.ServiceLister, coreinformers.SecretInformer, *fakeclientset.Clientset) {
@@ -130,6 +133,16 @@ func initsWithCustomLB(ctx context.Context, ingressClassList *networkingv1.Ingre
 		ingressInformer, saInformer, serviceLister, secretInformer, fakeClient, nil, nil, false, fakeRecorder)
 }
 
+func drainControllerQueue(c *Controller) {
+	for c.queue.Len() > 0 {
+		item, shutdown := c.queue.Get()
+		if shutdown {
+			return
+		}
+		c.queue.Done(item)
+	}
+}
+
 // Mock that returns a listener with nil Protocol
 type MockLoadBalancerClientNilProtocol struct{ MockLoadBalancerClient }
 
@@ -204,6 +217,167 @@ func TestEnsureIngressSuccess(t *testing.T) {
 	c := inits(ctx, ingressClassList, ingressList)
 	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
 	Expect(err == nil).Should(Equal(true))
+}
+
+func TestEnsureIngress_CreateListenerWithMultipleCertificateIds(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA,certB")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort: 443,
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.CreateListenerRequests)).Should(Equal(1))
+	Expect(capturingLB.CreateListenerRequests[0].CreateListenerDetails.SslConfiguration.CertificateIds).Should(Equal([]string{"certA", "certB"}))
+}
+
+func TestEnsureIngress_UpdateListenerSingleToMultiCertificateIds(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA,certB")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingCertificateIDs: []string{"certA"},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(1))
+	Expect(capturingLB.UpdateListenerRequests[0].UpdateListenerDetails.SslConfiguration.CertificateIds).Should(Equal([]string{"certA", "certB"}))
+}
+
+func TestEnsureIngress_UpdateListenerMultiToSingleCertificateIds(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingCertificateIDs: []string{"certA", "certB"},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(1))
+	Expect(capturingLB.UpdateListenerRequests[0].UpdateListenerDetails.SslConfiguration.CertificateIds).Should(Equal([]string{"certA"}))
+}
+
+func TestEnsureIngress_UpdateListenerNoopWhenCertificateIdsMatch(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA,certB")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingCertificateIDs: []string{"certA", "certB"},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(0))
+}
+
+func TestEnsureIngress_UpdateListenerClearsCertificateIdsWhenDesiredSslConfigAbsent(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingCertificateIDs: []string{"certA", "certB"},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(1))
+	Expect(capturingLB.UpdateListenerRequests[0].UpdateListenerDetails.SslConfiguration).NotTo(BeNil())
+	Expect(capturingLB.UpdateListenerRequests[0].UpdateListenerDetails.SslConfiguration.CertificateIds).Should(Equal([]string{}))
+}
+
+func TestEnsureIngress_UpdateListenerNoopWhenExistingSslConfigAlreadyCleared(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:           80,
+		ExistingCertificateIDs: []string{},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(len(capturingLB.UpdateListenerRequests)).Should(Equal(0))
+}
+
+func TestEnsureIngress_CreateListenerUnsupportedMultiCertErrorIsActionable(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA,certB")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:      443,
+		CreateListenerErr: unsupportedCapabilityServiceError{},
+		UpdateListenerErr: nil,
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(Equal(multiCertificateWarning))
+}
+
+func TestEnsureIngress_UpdateListenerUnsupportedMultiCertErrorPublishesActionableEvent(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressList := getIngressListWithDirectCertificates("certA,certB")
+	capturingLB := &CapturingLoadBalancerClient{
+		ListenerPort:      80,
+		UpdateListenerErr: unsupportedCapabilityServiceError{},
+	}
+	c := initsWithCustomLB(ctx, ingressClassList, ingressList, capturingLB)
+
+	err := c.ensureIngress(getContextWithClient(c, ctx), &ingressList.Items[0], &ingressClassList.Items[0])
+	Expect(err).To(HaveOccurred())
+	Expect(err.Error()).To(Equal(multiCertificateWarning))
+
+	fakeRecorder, ok := c.eventRecorder.(*events.FakeRecorder)
+	Expect(ok).To(BeTrue())
+	c.handleErr(err, fmt.Sprintf("%s/%s", namespace, ingressList.Items[0].Name))
+
+	select {
+	case event := <-fakeRecorder.Events:
+		Expect(event).To(ContainSubstring("IngressReconcileFailed"))
+		Expect(event).To(ContainSubstring(multiCertificateWarning))
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected warning event for unsupported multi-cert capability failure")
+	}
 }
 
 func getContextWithClient(c *Controller, ctx context.Context) context.Context {
@@ -296,6 +470,7 @@ func TestIngressAdd(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPath)
 	c := inits(ctx, ingressClassList, ingressList)
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
 	c.ingressAdd(&ingressList.Items[0])
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
@@ -308,7 +483,7 @@ func TestIngressUpdate(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
-
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
 	c.ingressUpdate(&ingressList.Items[0], &ingressList.Items[1])
 	Expect(c.queue.Len()).Should(Equal(queueSize))
@@ -328,6 +503,7 @@ func TestIngressDelete(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
 	c.ingressDelete(&ingressList.Items[0])
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
@@ -340,8 +516,9 @@ func TestSecretAdd(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
-	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret"}}, false)
+	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}}, false)
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
 }
 
@@ -352,8 +529,9 @@ func TestSecretAdd_IsInInitialList(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
-	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret"}}, true)
+	c.secretAdd(&v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}}, true)
 	Expect(c.queue.Len()).Should(Equal(queueSize))
 }
 
@@ -364,8 +542,9 @@ func TestSecretUpdate(t *testing.T) {
 	ingressClassList := util.GetIngressClassList()
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithTlsSecret)
 	c := inits(ctx, ingressClassList, ingressList)
+	drainControllerQueue(c)
 	queueSize := c.queue.Len()
-	c.secretUpdate(nil, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret"}})
+	c.secretUpdate(nil, &v1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tls-secret", Namespace: namespace}})
 	Expect(c.queue.Len()).Should(Equal(queueSize + 1))
 }
 
@@ -377,6 +556,7 @@ func TestProcessNextItem(t *testing.T) {
 	ingressList := util.ReadResourceAsIngressList(ingressPathWithFinalizer)
 	c := inits(ctx, ingressClassList, ingressList)
 
+	drainControllerQueue(c)
 	c.queue.Add("default-ingress-class")
 	res := c.processNextItem()
 	Expect(res).Should(BeTrue())
@@ -533,6 +713,147 @@ func (m *staleSSLLoadBalancerClient) UpdateListener(ctx context.Context, request
 
 func (m MockLoadBalancerClient) DeleteListener(ctx context.Context, request ociloadbalancer.DeleteListenerRequest) (ociloadbalancer.DeleteListenerResponse, error) {
 	return ociloadbalancer.DeleteListenerResponse{}, nil
+}
+
+type CapturingLoadBalancerClient struct {
+	MockLoadBalancerClient
+	ListenerPort           int
+	ExistingCertificateIDs []string
+	CreateListenerErr      error
+	UpdateListenerErr      error
+	CreateListenerRequests []ociloadbalancer.CreateListenerRequest
+	UpdateListenerRequests []ociloadbalancer.UpdateListenerRequest
+}
+
+func (m *CapturingLoadBalancerClient) GetLoadBalancer(ctx context.Context, request ociloadbalancer.GetLoadBalancerRequest) (ociloadbalancer.GetLoadBalancerResponse, error) {
+	res := util.SampleLoadBalancerResponse()
+	if m.ListenerPort <= 0 {
+		return res, nil
+	}
+
+	listenerName := util.GenerateListenerName(int32(m.ListenerPort))
+	listenerPort := m.ListenerPort
+	protocol := util.ProtocolHTTP
+	defaultBackendSet := util.DefaultBackendSetName
+	sslConfig := &ociloadbalancer.SslConfiguration{
+		CertificateIds: append([]string(nil), m.ExistingCertificateIDs...),
+	}
+	res.LoadBalancer.Listeners = map[string]ociloadbalancer.Listener{
+		listenerName: {
+			Name:                  common.String(listenerName),
+			DefaultBackendSetName: common.String(defaultBackendSet),
+			Port:                  common.Int(listenerPort),
+			Protocol:              common.String(protocol),
+			SslConfiguration:      sslConfig,
+			RoutingPolicyName:     common.String(listenerName),
+		},
+	}
+	return res, nil
+}
+
+func (m *CapturingLoadBalancerClient) CreateListener(ctx context.Context, request ociloadbalancer.CreateListenerRequest) (ociloadbalancer.CreateListenerResponse, error) {
+	m.CreateListenerRequests = append(m.CreateListenerRequests, request)
+	reqID := "opcrequestid"
+	if m.CreateListenerErr != nil {
+		return ociloadbalancer.CreateListenerResponse{
+			RawResponse:      nil,
+			OpcWorkRequestId: &reqID,
+			OpcRequestId:     &reqID,
+		}, m.CreateListenerErr
+	}
+	return ociloadbalancer.CreateListenerResponse{
+		RawResponse:      nil,
+		OpcWorkRequestId: &reqID,
+		OpcRequestId:     &reqID,
+	}, nil
+}
+
+func (m *CapturingLoadBalancerClient) UpdateListener(ctx context.Context, request ociloadbalancer.UpdateListenerRequest) (ociloadbalancer.UpdateListenerResponse, error) {
+	m.UpdateListenerRequests = append(m.UpdateListenerRequests, request)
+	reqID := "opcrequestid"
+	if m.UpdateListenerErr != nil {
+		return ociloadbalancer.UpdateListenerResponse{
+			RawResponse:      nil,
+			OpcWorkRequestId: &reqID,
+			OpcRequestId:     &reqID,
+		}, m.UpdateListenerErr
+	}
+	return ociloadbalancer.UpdateListenerResponse{
+		RawResponse:      nil,
+		OpcWorkRequestId: &reqID,
+		OpcRequestId:     &reqID,
+	}, nil
+}
+
+func (m *CapturingLoadBalancerClient) DeleteListener(ctx context.Context, request ociloadbalancer.DeleteListenerRequest) (ociloadbalancer.DeleteListenerResponse, error) {
+	reqID := "opcrequestid"
+	return ociloadbalancer.DeleteListenerResponse{
+		RawResponse:      nil,
+		OpcWorkRequestId: &reqID,
+		OpcRequestId:     &reqID,
+	}, nil
+}
+
+func getIngressListWithDirectCertificates(certificateList string) *networkingv1.IngressList {
+	pathType := networkingv1.PathTypeExact
+	return &networkingv1.IngressList{
+		Items: []networkingv1.Ingress{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "ingress-multi-cert",
+					Namespace: namespace,
+					Annotations: map[string]string{
+						util.IngressListenerTlsCertificateAnnotation: certificateList,
+					},
+				},
+				Spec: networkingv1.IngressSpec{
+					Rules: []networkingv1.IngressRule{
+						{
+							Host: "foo.bar.com",
+							IngressRuleValue: networkingv1.IngressRuleValue{
+								HTTP: &networkingv1.HTTPIngressRuleValue{
+									Paths: []networkingv1.HTTPIngressPath{
+										{
+											PathType: &pathType,
+											Path:     "/testecho1",
+											Backend: networkingv1.IngressBackend{
+												Service: &networkingv1.IngressServiceBackend{
+													Name: "testecho1",
+													Port: networkingv1.ServiceBackendPort{Number: 80},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+type unsupportedCapabilityServiceError struct{}
+
+func (e unsupportedCapabilityServiceError) Error() string {
+	return "BadRequest"
+}
+
+func (e unsupportedCapabilityServiceError) GetHTTPStatusCode() int {
+	return 400
+}
+
+func (e unsupportedCapabilityServiceError) GetMessage() string {
+	return "BadRequest"
+}
+
+func (e unsupportedCapabilityServiceError) GetCode() string {
+	return "InvalidParameter"
+}
+
+func (e unsupportedCapabilityServiceError) GetOpcRequestID() string {
+	return "fake-opc-request-id"
 }
 
 // MockConfigGetter is a mock implementation of the ConfigGetter interface for testing purposes.

@@ -15,6 +15,28 @@ import (
 	"github.com/oracle/oci-native-ingress-controller/pkg/oci/client"
 )
 
+type badRequestServiceError struct{}
+
+func (e badRequestServiceError) Error() string {
+	return "BadRequest"
+}
+
+func (e badRequestServiceError) GetHTTPStatusCode() int {
+	return 400
+}
+
+func (e badRequestServiceError) GetMessage() string {
+	return "BadRequest"
+}
+
+func (e badRequestServiceError) GetCode() string {
+	return "InvalidParameter"
+}
+
+func (e badRequestServiceError) GetOpcRequestID() string {
+	return "fake-opc-request-id"
+}
+
 func TestLoadBalancerClient_DeleteLoadBalancer(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -80,6 +102,36 @@ func TestLoadBalancerClient_CreateListener(t *testing.T) {
 	err = loadBalancerClient.CreateListener(context.TODO(), "id", 8080, util.ProtocolHTTP2, util.DefaultBackendSetName, &sslConfigDetail)
 	Expect(err).To(BeNil())
 
+}
+
+func TestLoadBalancerClient_CreateListener_PreservesMultiCertificateIds(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedCreateListenerRequest = nil
+
+	sslConfigDetail := getSslConfigurationDetails("id")
+	sslConfigDetail.CertificateIds = []string{"cert-1", "cert-2", "cert-3"}
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP, util.DefaultBackendSetName, &sslConfigDetail)
+	Expect(err).To(BeNil())
+	Expect(capturedCreateListenerRequest).ToNot(BeNil())
+	Expect(capturedCreateListenerRequest.CreateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+}
+
+func TestLoadBalancerClient_CreateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	mockCreateListenerErr = badRequestServiceError{}
+	defer func() {
+		mockCreateListenerErr = nil
+	}()
+
+	sslConfigDetail := getSslConfigurationDetails("id")
+	sslConfigDetail.CertificateIds = []string{"cert-1", "cert-2"}
+	err := loadBalancerClient.CreateListener(context.TODO(), "id", 8443, util.ProtocolHTTP, util.DefaultBackendSetName, &sslConfigDetail)
+	Expect(err).ToNot(BeNil())
+	Expect(err.Error()).To(Equal(multiCertificateCapabilityErrorMessage))
+	var capabilityErr *multiCertificateCapabilityError
+	Expect(errors.As(err, &capabilityErr)).To(BeTrue())
 }
 
 func getSslConfigurationDetails(id string) ociloadbalancer.SslConfigurationDetails {
@@ -266,6 +318,78 @@ func TestLoadBalancerClient_UpdateListenerClearsSSLWhenNotPreserved(t *testing.T
 	Expect(mockClient.updateListenerRequest.UpdateListenerDetails.SslConfiguration).To(BeNil())
 }
 
+func TestLoadBalancerClient_UpdateListener_PreservesExistingMultiCertificateIdsWhenNilSslConfig(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds: []string{"cert-a", "cert-b"},
+		},
+	}
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, nil, &proto, nil, true)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(capturedUpdateListenerRequest.UpdateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-a", "cert-b"}))
+}
+
+func TestLoadBalancerClient_UpdateListener_PreservesDesiredMultiCertificateIds(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateListenerRequest = nil
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+	}
+	ssConfig := getSslConfigurationDetails(id)
+	ssConfig.CertificateIds = []string{"cert-1", "cert-2", "cert-3"}
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil, true)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateListenerRequest).ToNot(BeNil())
+	Expect(capturedUpdateListenerRequest.UpdateListenerDetails.SslConfiguration.CertificateIds).To(Equal([]string{"cert-1", "cert-2", "cert-3"}))
+}
+
+func TestLoadBalancerClient_UpdateListener_WrapsUnsupportedCapabilityErrorsForMultiCert(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	mockUpdateListenerErr = badRequestServiceError{}
+	defer func() {
+		mockUpdateListenerErr = nil
+	}()
+
+	id := "id"
+	pname := "route_80"
+	proto := util.ProtocolHTTP
+	port := 8080
+	listener := ociloadbalancer.Listener{
+		Name:     &pname,
+		Port:     &port,
+		Protocol: &proto,
+	}
+	ssConfig := getSslConfigurationDetails(id)
+	ssConfig.CertificateIds = []string{"cert-1", "cert-2"}
+
+	err := loadBalancerClient.UpdateListener(context.TODO(), &id, "", listener, &pname, &ssConfig, &proto, nil, true)
+	Expect(err).ToNot(BeNil())
+	Expect(err.Error()).To(Equal(multiCertificateCapabilityErrorMessage))
+	var capabilityErr *multiCertificateCapabilityError
+	Expect(errors.As(err, &capabilityErr)).To(BeTrue())
+}
+
 func TestLoadBalancerClient_UpdateNetworkSecurityGroups(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()
@@ -288,6 +412,12 @@ func setupLBClient() *LoadBalancerClient {
 func GetLoadBalancerClient() client.LoadBalancerInterface {
 	return &MockLoadBalancerClient{}
 }
+
+var cachedSAs map[string]map[string]interface{}
+var capturedCreateListenerRequest *ociloadbalancer.CreateListenerRequest
+var capturedUpdateListenerRequest *ociloadbalancer.UpdateListenerRequest
+var mockCreateListenerErr error
+var mockUpdateListenerErr error
 
 type MockLoadBalancerClient struct {
 }
@@ -427,7 +557,16 @@ func (m MockLoadBalancerClient) DeleteRoutingPolicy(ctx context.Context, request
 }
 
 func (m MockLoadBalancerClient) CreateListener(ctx context.Context, request ociloadbalancer.CreateListenerRequest) (ociloadbalancer.CreateListenerResponse, error) {
+	copied := request
+	capturedCreateListenerRequest = &copied
 	id := "id"
+	if mockCreateListenerErr != nil {
+		return ociloadbalancer.CreateListenerResponse{
+			RawResponse:      nil,
+			OpcWorkRequestId: &id,
+			OpcRequestId:     &id,
+		}, mockCreateListenerErr
+	}
 	return ociloadbalancer.CreateListenerResponse{
 		RawResponse:      nil,
 		OpcWorkRequestId: &id,
@@ -436,9 +575,13 @@ func (m MockLoadBalancerClient) CreateListener(ctx context.Context, request ocil
 }
 
 func (m MockLoadBalancerClient) UpdateListener(ctx context.Context, request ociloadbalancer.UpdateListenerRequest) (ociloadbalancer.UpdateListenerResponse, error) {
+	copied := request
+	capturedUpdateListenerRequest = &copied
 	id := "id"
 	var err error
-	if *request.ListenerName == "error" {
+	if mockUpdateListenerErr != nil {
+		err = mockUpdateListenerErr
+	} else if *request.ListenerName == "error" {
 		err = errors.New("listener error")
 	}
 	return ociloadbalancer.UpdateListenerResponse{

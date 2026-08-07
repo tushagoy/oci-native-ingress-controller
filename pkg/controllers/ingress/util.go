@@ -23,6 +23,7 @@ import (
 	"github.com/oracle/oci-native-ingress-controller/pkg/client"
 	"github.com/oracle/oci-native-ingress-controller/pkg/state"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
+	"k8s.io/apimachinery/pkg/util/sets"
 	v1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 	"reflect"
@@ -223,34 +224,54 @@ func GetSSLConfigForBackendSet(namespace string, artifactType string, artifact s
 	return backendSetSslConfig, nil
 }
 
-func GetSSLConfigForListener(namespace string, listener *ociloadbalancer.Listener, artifactType string, artifact string,
+func GetSSLConfigForListener(listener *ociloadbalancer.Listener, tlsConfigs []state.TlsConfig,
 	compartmentId string, secretLister v1.SecretLister, client *client.WrapperClient) (*ociloadbalancer.SslConfigurationDetails, error) {
-	var currentCertificateId string
-	var newCertificateId string
-
-	var listenerSslConfig *ociloadbalancer.SslConfigurationDetails
-
-	if listener != nil && listener.SslConfiguration != nil && len(listener.SslConfiguration.CertificateIds) > 0 {
-		currentCertificateId = listener.SslConfiguration.CertificateIds[0]
+	if len(tlsConfigs) == 0 {
+		return nil, nil
 	}
 
-	if state.ArtifactTypeCertificate == artifactType {
-		newCertificateId = artifact
-	}
+	certificateIds := make([]string, 0, len(tlsConfigs))
+	seenCertificateIds := sets.NewString()
 
-	if state.ArtifactTypeSecret == artifactType && artifact != "" {
-		cId, err := ensureCertificateForListener(currentCertificateId, namespace, artifact, compartmentId, secretLister, client)
-		if err != nil {
-			return nil, err
+	for _, tlsConfig := range tlsConfigs {
+		var resolvedCertificateID string
+		switch tlsConfig.Type {
+		case state.ArtifactTypeCertificate:
+			resolvedCertificateID = tlsConfig.Artifact
+		case state.ArtifactTypeSecret:
+			// Normal validation should prevent empty secret artifacts; skip defensively.
+			if tlsConfig.Artifact == "" {
+				continue
+			}
+
+			certificateID, err := ensureCertificateForListener("", tlsConfig.Namespace, tlsConfig.Artifact, compartmentId, secretLister, client)
+			if err != nil {
+				return nil, err
+			}
+			resolvedCertificateID = certificateID
+		default:
+			// Ignore unknown artifact types defensively so one malformed entry does not block other listener certs.
+			continue
 		}
-		newCertificateId = cId
+
+		// CertificateIds must contain the full unique certificate list for listener SNI.
+		if resolvedCertificateID == "" {
+			continue
+		}
+
+		// A direct OCID and a secret can resolve to the same certificate; keep the first stable occurrence.
+		if seenCertificateIds.Has(resolvedCertificateID) {
+			continue
+		}
+		seenCertificateIds.Insert(resolvedCertificateID)
+		certificateIds = append(certificateIds, resolvedCertificateID)
 	}
 
-	if newCertificateId != "" {
-		certificateIds := []string{newCertificateId}
-		listenerSslConfig = &ociloadbalancer.SslConfigurationDetails{CertificateIds: certificateIds}
+	if len(certificateIds) == 0 {
+		return nil, nil
 	}
-	return listenerSslConfig, nil
+
+	return &ociloadbalancer.SslConfigurationDetails{CertificateIds: certificateIds}, nil
 }
 
 // ensureCertificateForListener creates/updates a certificate for Listeners, when the artifact is of type secret
@@ -268,7 +289,7 @@ func ensureCertificateForListener(inputCertificateId string, namespace string, s
 
 	certificateId, err := VerifyOrGetCertificateIdByName(inputCertificateId, certificateName, compartmentId, client.GetCertClient())
 	if err != nil {
-		return "", nil
+		return "", err
 	}
 
 	if certificateId == "" {

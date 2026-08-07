@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/oracle/oci-go-sdk/v65/certificates"
 	"github.com/oracle/oci-go-sdk/v65/certificatesmanagement"
+	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/containerengine"
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	ociwaf "github.com/oracle/oci-go-sdk/v65/waf"
@@ -75,6 +76,22 @@ type WrapperClient struct {
 	containerEngineClient *containerengine.ContainerEngineClient
 }
 
+func getCertificatesRetryPolicy() *common.RetryPolicy {
+	retryPolicy := common.DefaultRetryPolicyWithoutEventualConsistency()
+	return &retryPolicy
+}
+
+func configureCertificatesClientsRetryPolicy(certBundleClient *certificates.CertificatesClient, certMgmtClient *certificatesmanagement.CertificatesManagementClient) {
+	if certBundleClient != nil {
+		certBundleClient.BaseClient.Configuration.RetryPolicy = getCertificatesRetryPolicy()
+	}
+
+	if certMgmtClient != nil {
+		certMgmtClient.BaseClient.Configuration.RetryPolicy = getCertificatesRetryPolicy()
+	}
+}
+
+// NewWrapperClient creates a new instance of WrapperClient with a ConfigGetter
 func newWrapperClientFromConfig(configGetter auth.ConfigGetter, k8sClient kubernetes.Interface) (*WrapperClient, error) {
 	configProvider, err := configGetter.GetConfigurationProvider()
 	if err != nil {
@@ -94,6 +111,9 @@ func newWrapperClientFromConfig(configGetter auth.ConfigGetter, k8sClient kubern
 	if err != nil {
 		return nil, err
 	}
+
+	// Retry transient OCI Certificates throttling (HTTP 429) at the SDK client layer.
+	configureCertificatesClientsRetryPolicy(&ociCertificatesClient, &ociCertificatesMgmtClient)
 
 	ociWafClient, err := ociwaf.NewWafClientWithConfigurationProvider(configProvider)
 	if err != nil {

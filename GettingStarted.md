@@ -456,13 +456,16 @@ testecho-7cdcfff87f-b6xt4                        1/1     Running   0          72
 ```
 
 #### HTTPS/TLS Support
-We will be able to configure ingress routes those are HTTPS enabled. Customers can use a Kubernetes secret (TLS) or a certificate from certificate service.
+We can configure HTTPS-enabled ingress routes using Kubernetes TLS secrets, OCI certificate OCIDs, or both.
 
 - The controller will appropriately configure both listener and backend sets with provided credentials.
 - In the case of Kubernetes secret we create a certificate service certificate and a ca bundle to configure the listener and backend set appropriately.
-- In the case of certificates we use the certificate Id and certificate trust authority Id to configure listener and backend set.
+- In the case of direct OCI certificates we use `oci-native-ingress.oraclecloud.com/certificate-ocid` to configure listener SSL termination.
+- `oci-native-ingress.oraclecloud.com/certificate-ocid` accepts a comma-separated list so multiple certificates can be attached to one listener.
+- Multiple `spec.tls` secrets that map to one listener are aggregated into one listener SSL configuration.
 - Customer can use the same credentials in their pods to make this an end to end SSL support.
 - If the customer wishes to terminate TLS on the LB and run plain text (HTTP) backend, they can use the annotation `oci-native-ingress.oraclecloud.com/backend-tls-enabled: "false"` on the Ingress
+- In tenancies or regions where OCI LB multi-certificate listeners are not enabled, NIC surfaces an actionable reconcile error and warning event and does not fall back to a multi-listener workaround.
 
 ##### Sample configuration : Using Secret
 We create OCI certificate service certificates and cabundles for each kubernetes secret. Hence the content of the secret (ca.crt, tls.crt, tls.key) should conform to the certificate service standards.
@@ -513,14 +516,14 @@ spec:
 ```
 
 ##### Sample configuration : Using Certificate
-Certificate should have the common name of the host specified.
+Certificate should have the common name of the host specified. For multi-certificate listeners, provide a comma-separated list.
 ```
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: ingress-tls
   annotations:
-    oci-native-ingress.oraclecloud.com/certificate-ocid: ocid1.certificate.oc1.iad.amaaaaaah4gjgpyaxlby5qciob5wnwa7cnm4brvq2tfta3ls6ngch3s6gabc
+    oci-native-ingress.oraclecloud.com/certificate-ocid: ocid1.certificate.oc1.iad.<cert-a>,ocid1.certificate.oc1.iad.<cert-b>
 spec:
   rules:
   - host: "*.bar.com"
@@ -715,7 +718,7 @@ All changes to those modules should be reflected in the remote VCS repository.
 
 ### Known Issues
 1. The loadbalancer has a limitation of 16 backend sets per load balancer. We create a backend set for every unique service and port combination. So if a customer has more such services they need to have new load balancers.
-2. Each service port is mapped to a load balancer listener. For SSL configuration customer can specify only one key pair per listener which would be used for SSL termination. All the backend sets that are mapped to the listener will use the same issuer(CA Bundle) as the issuer of listener certificate. Any conflicting declarations across ingress resources for same listener will throw a validation error which will be logged in controller logs.
+2. Each service port is mapped to one load balancer listener. Listener SSL configuration can include multiple certificates (from multiple `spec.tls` secrets and/or comma-separated direct certificate OCIDs). In tenancies or regions where OCI LB multi-certificate listener capability is not enabled, multi-certificate requests are rejected by OCI LB and surfaced by NIC as actionable reconcile errors and warning events.
 3. Any conflicting declarations for same backend set health checker and routing policy across ingress resources will throw a validation error which will be logged in controller logs.
 4. For supporting ssl through kubernetes secrets, we generate respective certificates and ca bundles in certificate service. If we delete ingress resource, currently we only delete the load balancer resources.
 The certificates need to be cleared by the customer.

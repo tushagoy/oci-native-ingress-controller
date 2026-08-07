@@ -303,12 +303,23 @@ func GetIngressClassLoadBalancerId(ic *networkingv1.IngressClass) string {
 	return id
 }
 
-func GetListenerTlsCertificateOcid(i *networkingv1.Ingress) *string {
+func GetListenerTlsCertificateOcids(i *networkingv1.Ingress) []string {
 	value, ok := i.Annotations[IngressListenerTlsCertificateAnnotation]
 	if !ok {
 		return nil
 	}
-	return &value
+
+	ocids := make([]string, 0)
+	seen := sets.NewString()
+	for _, entry := range strings.Split(value, ",") {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" || seen.Has(trimmed) {
+			continue
+		}
+		seen.Insert(trimmed)
+		ocids = append(ocids, trimmed)
+	}
+	return ocids
 }
 
 func GetBackendTlsEnabled(i *networkingv1.Ingress) bool {
@@ -953,7 +964,7 @@ func DetermineListenerPort(ingress *networkingv1.Ingress, tlsConfiguredHosts *se
 		return 0, fmt.Errorf("error parsing Ingress Https Listener Port: %w", err)
 	}
 
-	isCertOcidPresent := GetListenerTlsCertificateOcid(ingress) != nil
+	isCertOcidPresent := len(GetListenerTlsCertificateOcids(ingress)) > 0
 
 	listenerPort := servicePort
 	if isCertOcidPresent || tlsConfiguredHosts.Has(host) {
@@ -980,6 +991,11 @@ func IsBackendServiceEqual(b1 *networkingv1.IngressBackend, b2 *networkingv1.Ing
 
 func IsIngressProtocolTCP(ingress *networkingv1.Ingress) bool {
 	return GetIngressProtocol(ingress) == ProtocolTCP
+}
+
+func IsIngressProtocolHTTPBased(ingress *networkingv1.Ingress) bool {
+	protocol := GetIngressProtocol(ingress)
+	return protocol == ProtocolHTTP || protocol == ProtocolHTTP2
 }
 
 // StringSlicesHaveSameElements checks if s1 and s2 have the same elements, ignoring order and duplicates.

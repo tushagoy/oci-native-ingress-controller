@@ -288,10 +288,14 @@ func TestGetSSLConfigForBackendSet(t *testing.T) {
 func TestGetSSLConfigForListener(t *testing.T) {
 	RegisterTestingT(t)
 
+	secretWithLookupError := util.GetSampleCertSecret(namespace, "secret-with-lookup-error", "chain", "cert", "key")
+	secretWithLookupError.UID = "error"
+
 	secretList := &corev1.SecretList{
 		Items: []corev1.Secret{
 			*util.GetSampleCertSecret(namespace, "secret", "chain", "cert", "key"),
 			*util.GetSampleCertSecret(namespace, "secret-cert", "chain", "cert", "key"),
+			*secretWithLookupError,
 		},
 	}
 
@@ -299,42 +303,63 @@ func TestGetSSLConfigForListener(t *testing.T) {
 	mockClient, err := c.GetClient(&MockConfigGetter{})
 	Expect(err).Should(BeNil())
 
-	//no listener for cert
-	sslConfig, err := GetSSLConfigForListener(namespace, nil, state.ArtifactTypeCertificate, "certificate", "", secretLister, mockClient)
-	Expect(err).Should(BeNil())
-	Expect(sslConfig != nil).Should(BeTrue())
-	Expect(len(sslConfig.CertificateIds)).Should(Equal(1))
-	Expect(sslConfig.CertificateIds[0]).Should(Equal("certificate"))
-
-	//no listener for secret
-	sslConfig, err = GetSSLConfigForListener(namespace, nil, state.ArtifactTypeSecret, "secret", "", secretLister, mockClient)
-	Expect(err).Should(BeNil())
-	Expect(sslConfig != nil).Should(BeTrue())
-	Expect(len(sslConfig.CertificateIds)).Should(Equal(1))
-	Expect(sslConfig.CertificateIds[0]).Should(Equal("id"))
-
-	// Listener + certificate
-	var certIds []string
-	certIds = append(certIds, "secret-cert", "cabundle")
-	customSslConfig := ociloadbalancer.SslConfiguration{
-		CertificateIds: certIds,
+	tlsConfigs := []state.TlsConfig{
+		{Type: state.ArtifactTypeCertificate, Artifact: "certificateA"},
+		{Type: state.ArtifactTypeCertificate, Artifact: "certificateB"},
+		{Type: state.ArtifactTypeCertificate, Artifact: "certificateA"},
 	}
+	sslConfig, err := GetSSLConfigForListener(nil, tlsConfigs, "", secretLister, mockClient)
+	Expect(err).Should(BeNil())
+	Expect(sslConfig != nil).Should(BeTrue())
+	Expect(sslConfig.CertificateIds).Should(Equal([]string{"certificateA", "certificateB"}))
+
+	tlsConfigs = []state.TlsConfig{
+		{Type: state.ArtifactTypeSecret, Artifact: "secret", Namespace: namespace},
+	}
+	sslConfig, err = GetSSLConfigForListener(nil, tlsConfigs, "", secretLister, mockClient)
+	Expect(err).Should(BeNil())
+	Expect(sslConfig != nil).Should(BeTrue())
+	Expect(sslConfig.CertificateIds).Should(Equal([]string{"id"}))
+
 	listener := ociloadbalancer.Listener{
-		SslConfiguration: &customSslConfig,
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds: []string{"existing-1", "existing-2"},
+		},
 	}
-	sslConfig, err = GetSSLConfigForListener(namespace, &listener, state.ArtifactTypeCertificate, "certificate", "", secretLister, mockClient)
+	tlsConfigs = []state.TlsConfig{
+		{Type: state.ArtifactTypeCertificate, Artifact: "direct-a"},
+		{Type: state.ArtifactTypeSecret, Artifact: "secret", Namespace: namespace},
+		{Type: state.ArtifactTypeCertificate, Artifact: "id"},
+		{Type: state.ArtifactTypeSecret, Artifact: "secret-cert", Namespace: namespace},
+	}
+	sslConfig, err = GetSSLConfigForListener(&listener, tlsConfigs, "", secretLister, mockClient)
 	Expect(err).Should(BeNil())
 	Expect(sslConfig != nil).Should(BeTrue())
-	Expect(len(sslConfig.CertificateIds)).Should(Equal(1))
-	Expect(sslConfig.CertificateIds[0]).Should(Equal("certificate"))
+	Expect(sslConfig.CertificateIds).Should(Equal([]string{"direct-a", "id"}))
 
-	// Listener + secret
-	sslConfig, err = GetSSLConfigForListener(namespace, &listener, state.ArtifactTypeSecret, "secret-cert", "", secretLister, mockClient)
+	listener = ociloadbalancer.Listener{
+		SslConfiguration: &ociloadbalancer.SslConfiguration{
+			CertificateIds: []string{"error"},
+		},
+	}
+	tlsConfigs = []state.TlsConfig{
+		{Type: state.ArtifactTypeSecret, Artifact: "secret", Namespace: namespace},
+	}
+	sslConfig, err = GetSSLConfigForListener(&listener, tlsConfigs, "", secretLister, mockClient)
 	Expect(err).Should(BeNil())
 	Expect(sslConfig != nil).Should(BeTrue())
-	Expect(len(sslConfig.CertificateIds)).Should(Equal(1))
-	Expect(sslConfig.CertificateIds[0]).Should(Equal("id"))
+	Expect(sslConfig.CertificateIds).Should(Equal([]string{"id"}))
 
+	tlsConfigs = []state.TlsConfig{
+		{Type: state.ArtifactTypeSecret, Artifact: "secret-with-lookup-error", Namespace: namespace},
+	}
+	sslConfig, err = GetSSLConfigForListener(nil, tlsConfigs, "", secretLister, mockClient)
+	Expect(err).ShouldNot(BeNil())
+	Expect(sslConfig).Should(BeNil())
+
+	sslConfig, err = GetSSLConfigForListener(nil, []state.TlsConfig{}, "", secretLister, mockClient)
+	Expect(err).Should(BeNil())
+	Expect(sslConfig).Should(BeNil())
 }
 
 func TestGetTlsSecretContent(t *testing.T) {
@@ -586,7 +611,7 @@ func (m MockCertificateManagerClient) GetCertificate(ctx context.Context, reques
 }
 
 func (m MockCertificateManagerClient) ListCertificates(ctx context.Context, request certificatesmanagement.ListCertificatesRequest) (certificatesmanagement.ListCertificatesResponse, error) {
-	if *request.Name == "error" {
+	if *request.Name == "error" || *request.Name == "oci-nic-error" {
 		return certificatesmanagement.ListCertificatesResponse{}, errors.New("cert list error")
 	}
 
