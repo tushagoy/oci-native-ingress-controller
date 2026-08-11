@@ -77,6 +77,7 @@ const (
 	IngressClassDefinedTagsAnnotation             = "oci-native-ingress.oraclecloud.com/defined-tags"
 	IngressClassFreeformTagsAnnotation            = "oci-native-ingress.oraclecloud.com/freeform-tags"
 	IngressClassImplicitDefaultTagsAnnotation     = "oci-native-ingress.oraclecloud.com/implicit-default-tags"
+	IngressClassSecurityAttributesAnnotation      = "oci-native-ingress.oraclecloud.com/security-attributes"
 	IngressClassReservedPrivateIpAnnotation       = "oci-native-ingress.oraclecloud.com/reserved-private-ip-address-id"
 	OcidResourceTypePrivateIP                     = "privateip"
 	OcidResourceTypeIPv6                          = "ipv6"
@@ -321,6 +322,22 @@ func GetIngressClassFreeformTags(ic *networkingv1.IngressClass) (map[string]stri
 	}
 
 	return freeformTags, nil
+}
+
+// GetSecurityAttributes parses the security attributes annotation. A missing or
+// empty annotation means no security attributes are desired.
+func GetSecurityAttributes(ic *networkingv1.IngressClass) (map[string]map[string]interface{}, error) {
+	value, ok := ic.Annotations[IngressClassSecurityAttributesAnnotation]
+	if !ok || strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	securityAttributes := map[string]map[string]interface{}{}
+	if err := json.Unmarshal([]byte(value), &securityAttributes); err != nil {
+		return nil, errors.Wrap(err, "failed to parse security attributes annotation")
+	}
+
+	return securityAttributes, nil
 }
 
 func GetIngressProtocol(i *networkingv1.Ingress) string {

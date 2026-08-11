@@ -220,6 +220,30 @@ func TestCheckForIngressClassParameterUpdates(t *testing.T) {
 	Expect(err).Should(BeNil())
 }
 
+func TestCheckForIngressClassParameterUpdatesSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressClassList.Items[0].Annotations[util.IngressClassSecurityAttributesAnnotation] = `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`
+	lbClient := &MockLoadBalancerClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+	icp := v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			LoadBalancerName: "testecho1-998",
+			MinBandwidthMbps: 200,
+			MaxBandwidthMbps: 400,
+		},
+	}
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &icp)
+	Expect(err).Should(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.UpdateLoadBalancerRequests[0].SecurityAttributes).ShouldNot(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests[0].SecurityAttributes["Oracle-ZPR"]).Should(HaveKey("MaxEgressCount"))
+}
+
 func TestCheckForNetworkSecurityGroupsUpdate(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -235,6 +259,26 @@ func TestCheckForNetworkSecurityGroupsUpdate(t *testing.T) {
 
 	err := c.checkForNetworkSecurityGroupsUpdate(getContextWithClient(c, ctx), &ingressClassList.Items[0])
 	Expect(err).To(BeNil())
+}
+
+func TestCreateLoadBalancerWithSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                    fmt.Sprint(false),
+		util.IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`,
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-security-attributes", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{})
+	Expect(err).Should(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.CreateLoadBalancerRequests[0].SecurityAttributes).ShouldNot(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests[0].SecurityAttributes["Oracle-ZPR"]).Should(HaveKey("MaxEgressCount"))
 }
 
 func TestCreateLoadBalancer_WithReservedPrivateIPv4(t *testing.T) {
@@ -612,6 +656,7 @@ func (m MockWafClient) DeleteWebAppFirewall(ctx context.Context, request waf.Del
 
 type MockLoadBalancerClient struct {
 	CreateLoadBalancerRequests []ociloadbalancer.CreateLoadBalancerRequest
+	UpdateLoadBalancerRequests []ociloadbalancer.UpdateLoadBalancerRequest
 	GetLoadBalancerResponse    *ociloadbalancer.GetLoadBalancerResponse
 }
 
@@ -638,6 +683,7 @@ func (n NetworkError) Error() string {
 }
 
 func (m *MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerRequest) (response ociloadbalancer.UpdateLoadBalancerResponse, err error) {
+	m.UpdateLoadBalancerRequests = append(m.UpdateLoadBalancerRequests, request)
 	return ociloadbalancer.UpdateLoadBalancerResponse{
 		RawResponse:      nil,
 		OpcWorkRequestId: common.String("id"),

@@ -909,6 +909,44 @@ func TestLoadBalancerClient_UpdateNetworkSecurityGroups(t *testing.T) {
 	Expect(err).To(BeNil())
 }
 
+func TestLoadBalancerClient_UpdateLoadBalancerSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateLoadBalancerRequest = nil
+
+	securityAttributes := map[string]map[string]interface{}{
+		"Oracle-ZPR": {
+			"MaxEgressCount": map[string]interface{}{
+				"value": "42",
+				"mode":  "enforce",
+			},
+		},
+	}
+
+	_, err := loadBalancerClient.UpdateLoadBalancer(context.TODO(), "id", "name", nil, nil, securityAttributes)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateLoadBalancerRequest).ToNot(BeNil())
+	Expect(capturedUpdateLoadBalancerRequest.SecurityAttributes).To(Equal(securityAttributes))
+}
+
+func TestLoadBalancerClient_UpdateLoadBalancerClearsExistingSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateLoadBalancerRequest = nil
+	mockLoadBalancerResponseMutator = func(response *ociloadbalancer.GetLoadBalancerResponse) {
+		response.SecurityAttributes = map[string]map[string]interface{}{
+			"Oracle-ZPR": {"MaxEgressCount": "42"},
+		}
+	}
+	defer func() { mockLoadBalancerResponseMutator = nil }()
+
+	_, err := loadBalancerClient.UpdateLoadBalancer(context.TODO(), "id", "name", nil, nil, nil)
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateLoadBalancerRequest).ToNot(BeNil())
+	Expect(capturedUpdateLoadBalancerRequest.SecurityAttributes).ToNot(BeNil())
+	Expect(capturedUpdateLoadBalancerRequest.SecurityAttributes).To(BeEmpty())
+}
+
 func setupLBClient() *LoadBalancerClient {
 	lbClient := GetLoadBalancerClient()
 
@@ -928,6 +966,7 @@ var capturedCreateBackendSetRequest *ociloadbalancer.CreateBackendSetRequest
 var capturedCreateListenerRequest *ociloadbalancer.CreateListenerRequest
 var capturedUpdateBackendSetRequest *ociloadbalancer.UpdateBackendSetRequest
 var capturedUpdateListenerRequest *ociloadbalancer.UpdateListenerRequest
+var capturedUpdateLoadBalancerRequest *ociloadbalancer.UpdateLoadBalancerDetails
 var mockCreateListenerErr error
 var mockLoadBalancerResponseMutator func(*ociloadbalancer.GetLoadBalancerResponse)
 var mockUpdateListenerErr error
@@ -936,7 +975,9 @@ type MockLoadBalancerClient struct {
 }
 
 func (m MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerRequest) (response ociloadbalancer.UpdateLoadBalancerResponse, err error) {
-	return ociloadbalancer.UpdateLoadBalancerResponse{}, nil
+	details := request.UpdateLoadBalancerDetails
+	capturedUpdateLoadBalancerRequest = &details
+	return ociloadbalancer.UpdateLoadBalancerResponse{OpcWorkRequestId: common.String("id")}, nil
 }
 
 func (m MockLoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerShapeRequest) (response ociloadbalancer.UpdateLoadBalancerShapeResponse, err error) {

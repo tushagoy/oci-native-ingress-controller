@@ -305,6 +305,10 @@ func (c *Controller) createLoadBalancer(ctx context.Context, ic *networkingv1.In
 	if err != nil {
 		return nil, err
 	}
+	securityAttributes, err := util.GetSecurityAttributes(ic)
+	if err != nil {
+		return nil, err
+	}
 
 	createDetails := ociloadbalancer.CreateLoadBalancerDetails{
 		CompartmentId:           compartmentId,
@@ -321,8 +325,9 @@ func (c *Controller) createLoadBalancer(ctx context.Context, ic *networkingv1.In
 				},
 			},
 		},
-		FreeformTags: freeformTags,
-		DefinedTags:  definedTags,
+		FreeformTags:       freeformTags,
+		DefinedTags:        definedTags,
+		SecurityAttributes: securityAttributes,
 	}
 
 	reservedIps := make([]ociloadbalancer.ReservedIp, 0, 2)
@@ -435,9 +440,14 @@ func (c *Controller) checkForIngressClassParameterUpdates(ctx context.Context, i
 	if err != nil {
 		return err
 	}
+	securityAttributes, err := util.GetSecurityAttributes(ic)
+	if err != nil {
+		return err
+	}
 
-	if *lb.DisplayName != displayName || !isDefinedTagsEqual(lb.DefinedTags, definedTags) || !reflect.DeepEqual(lb.FreeformTags, freeformTags) {
-		_, err = wrapperClient.GetLbClient().UpdateLoadBalancer(context.Background(), *lb.Id, displayName, definedTags, freeformTags)
+	if *lb.DisplayName != displayName || !isDefinedTagsEqual(lb.DefinedTags, definedTags) ||
+		!reflect.DeepEqual(lb.FreeformTags, freeformTags) || !reflect.DeepEqual(lb.SecurityAttributes, securityAttributes) {
+		_, err = wrapperClient.GetLbClient().UpdateLoadBalancer(context.Background(), *lb.Id, displayName, definedTags, freeformTags, securityAttributes)
 		if err != nil {
 			return err
 		}
@@ -658,7 +668,7 @@ func (c *Controller) clearLoadBalancer(ctx context.Context, ic *networkingv1.Ing
 			*lb.Id, util.DefaultBackendSetName, err.Error(), ic.Name)
 	}
 
-	_, err = wrapperClient.GetLbClient().UpdateLoadBalancer(context.Background(), *lb.Id, *lb.DisplayName, map[string]map[string]interface{}{}, map[string]string{})
+	_, err = wrapperClient.GetLbClient().UpdateLoadBalancer(context.Background(), *lb.Id, *lb.DisplayName, map[string]map[string]interface{}{}, map[string]string{}, nil)
 	if err != nil {
 		klog.Errorf("While clearing LB %s, cannot clear tags due to %s, will proceed with IngressClass deletion for %s",
 			*lb.Id, err.Error(), ic.Name)

@@ -156,19 +156,23 @@ func (lbc *LoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, req 
 }
 
 func (lbc *LoadBalancerClient) UpdateLoadBalancer(ctx context.Context, lbId string, displayName string, definedTags map[string]map[string]interface{},
-	freeformTags map[string]string) (*loadbalancer.LoadBalancer, error) {
-	_, etag, err := lbc.GetLoadBalancer(ctx, lbId)
+	freeformTags map[string]string, securityAttributes map[string]map[string]interface{}) (*loadbalancer.LoadBalancer, error) {
+	lb, etag, err := lbc.GetLoadBalancer(ctx, lbId)
 	if err != nil {
 		return nil, err
+	}
+	if securityAttributes == nil && lb.SecurityAttributes != nil {
+		securityAttributes = map[string]map[string]interface{}{}
 	}
 
 	req := loadbalancer.UpdateLoadBalancerRequest{
 		LoadBalancerId: common.String(lbId),
 		IfMatch:        common.String(etag),
 		UpdateLoadBalancerDetails: loadbalancer.UpdateLoadBalancerDetails{
-			DisplayName:  common.String(displayName),
-			DefinedTags:  definedTags,
-			FreeformTags: freeformTags,
+			DisplayName:        common.String(displayName),
+			DefinedTags:        definedTags,
+			FreeformTags:       freeformTags,
+			SecurityAttributes: securityAttributes,
 		},
 	}
 
@@ -187,7 +191,7 @@ func (lbc *LoadBalancerClient) UpdateLoadBalancer(ctx context.Context, lbId stri
 		return nil, err
 	}
 
-	lb, _, err := lbc.getLoadBalancerBustCache(ctx, lbID)
+	lb, _, err = lbc.getLoadBalancerBustCache(ctx, lbID)
 	return lb, err
 }
 

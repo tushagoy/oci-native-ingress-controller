@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1202,4 +1203,74 @@ func TestHasServiceBackend(t *testing.T) {
 	Expect(HasServiceBackend(networkingv1.HTTPIngressPath{})).Should(BeFalse())
 	Expect(HasServiceBackend(resourceBackend)).Should(BeFalse())
 	Expect(HasServiceBackend(serviceBackend)).Should(BeTrue())
+}
+
+func TestGetSecurityAttributes(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    map[string]map[string]interface{}
+		wantErr     bool
+	}{
+		{
+			name:        "missing annotation",
+			annotations: map[string]string{},
+		},
+		{
+			name: "empty annotation",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: "",
+			},
+		},
+		{
+			name: "valid nested attributes",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`,
+			},
+			expected: map[string]map[string]interface{}{
+				"Oracle-ZPR": {
+					"MaxEgressCount": map[string]interface{}{
+						"value": "42",
+						"mode":  "enforce",
+					},
+				},
+			},
+		},
+		{
+			name: "valid scalar attribute",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"ZPR":{"MaxEgressCount":"zpr"}}`,
+			},
+			expected: map[string]map[string]interface{}{
+				"ZPR": {"MaxEgressCount": "zpr"},
+			},
+		},
+		{
+			name: "invalid outer value",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: "not a map",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid inner value",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":["foo"]}`,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ingressClass := &networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
+			actual, err := GetSecurityAttributes(ingressClass)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("GetSecurityAttributes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !reflect.DeepEqual(actual, tt.expected) {
+				t.Errorf("GetSecurityAttributes() = %#v, expected %#v", actual, tt.expected)
+			}
+		})
+	}
 }
