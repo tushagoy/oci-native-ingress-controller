@@ -31,6 +31,14 @@ func isDefinedTagsEqual(dt1, dt2 util.DefinedTagsType) bool {
 	return reflect.DeepEqual(getLowerCaseDefinedTags(dt1), getLowerCaseDefinedTags(dt2))
 }
 
+func isSecurityAttributesEqual(sa1, sa2 map[string]map[string]interface{}) bool {
+	if len(sa1) == 0 && len(sa2) == 0 {
+		return true
+	}
+
+	return reflect.DeepEqual(sa1, sa2)
+}
+
 func getImplicitDefaultTagsForNewLoadBalancer(actualDefinedTags, suppliedDefinedTags util.DefinedTagsType) util.DefinedTagsType {
 	defaultTags := util.DefinedTagsType{}
 	lowerCaseSuppliedDefinedTags := getLowerCaseDefinedTags(suppliedDefinedTags)

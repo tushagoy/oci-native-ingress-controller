@@ -446,7 +446,7 @@ func (c *Controller) checkForIngressClassParameterUpdates(ctx context.Context, i
 	}
 
 	if *lb.DisplayName != displayName || !isDefinedTagsEqual(lb.DefinedTags, definedTags) ||
-		!reflect.DeepEqual(lb.FreeformTags, freeformTags) || !reflect.DeepEqual(lb.SecurityAttributes, securityAttributes) {
+		!reflect.DeepEqual(lb.FreeformTags, freeformTags) || !isSecurityAttributesEqual(lb.SecurityAttributes, securityAttributes) {
 		_, err = wrapperClient.GetLbClient().UpdateLoadBalancer(context.Background(), *lb.Id, displayName, definedTags, freeformTags, securityAttributes)
 		if err != nil {
 			return err

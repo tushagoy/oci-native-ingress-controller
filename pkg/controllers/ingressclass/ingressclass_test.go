@@ -244,6 +244,31 @@ func TestCheckForIngressClassParameterUpdatesSecurityAttributes(t *testing.T) {
 	Expect(lbClient.UpdateLoadBalancerRequests[0].SecurityAttributes["Oracle-ZPR"]).Should(HaveKey("MaxEgressCount"))
 }
 
+func TestCheckForIngressClassParameterUpdatesMissingSecurityAttributesAnnotationSkipsEmptyReadback(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	delete(ingressClassList.Items[0].Annotations, util.IngressClassSecurityAttributesAnnotation)
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.DisplayName = common.String("k8s-default-ingress-class")
+	lbResponse.LoadBalancer.FreeformTags = map[string]string{}
+	lbResponse.LoadBalancer.SecurityAttributes = map[string]map[string]interface{}{}
+	lbClient := &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+	icp := v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			MinBandwidthMbps: 100,
+			MaxBandwidthMbps: 400,
+		},
+	}
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &icp)
+	Expect(err).Should(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests).Should(BeEmpty())
+}
+
 func TestCheckForNetworkSecurityGroupsUpdate(t *testing.T) {
 	RegisterTestingT(t)
 
