@@ -483,55 +483,9 @@ metadata:
     oci-native-ingress.oraclecloud.com/backendset-ssl-config: '{"cipherSuiteName":"oci-default-http2-tls-12-13-ssl-cipher-suite-v1","protocols":["TLSv1.2","TLSv1.3"]}'
 ```
 
-The annotation value is a JSON object. `cipherSuiteName` and `protocols` are optional individually, but the object must set at least one of them. NIC also accepts exported JSON field names for users copying Go-shaped examples:
+Each annotation accepts a JSON object with `cipherSuiteName`, `protocols`, or both. These annotations customize TLS that is already configured through `spec.tls`, `oci-native-ingress.oraclecloud.com/certificate-ocid`, or backend TLS settings; they do not enable TLS by themselves. When a field is omitted, NIC selects a compatible default. New TLS configurations default to TLS 1.2 and TLS 1.3.
 
-```yaml
-metadata:
-  annotations:
-    oci-native-ingress.oraclecloud.com/listener-ssl-config: '{"CipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3","Protocols":["TLSv1.2","TLSv1.3"]}'
-```
-
-These annotations are overlays on TLS configuration that already exists or is being created. They do not create TLS by themselves. Listener TLS still requires `spec.tls` or `oci-native-ingress.oraclecloud.com/certificate-ocid`; backend-set TLS still requires backend TLS inputs such as the default backend TLS behavior with a listener TLS artifact, or an explicit `oci-native-ingress.oraclecloud.com/backend-tls-enabled: "true"` with a TLS artifact. If the corresponding listener or backend set has no TLS target, its TLS policy annotation is inert and is not validated for that target.
-
-When NIC creates a listener or backend-set SSL configuration, omitted policy fields are filled from locked safe defaults:
-
-```yaml
-normal listener:
-  cipherSuiteName: oci-tls-12-13-ssl-cipher-suite-v3
-  protocols:
-    - TLSv1.2
-    - TLSv1.3
-HTTP2 or GRPC listener:
-  cipherSuiteName: oci-default-http2-tls-12-13-ssl-cipher-suite-v1
-  protocols:
-    - TLSv1.2
-    - TLSv1.3
-backend set:
-  cipherSuiteName: oci-default-http2-tls-12-13-ssl-cipher-suite-v1
-  protocols:
-    - TLSv1.2
-    - TLSv1.3
-```
-
-For protocols-only annotations, NIC chooses the omitted cipher suite from the effective protocol list instead of blindly using the TLS 1.2/TLS 1.3 default. For a normal listener, `{"protocols":["TLSv1.3"]}` uses `oci-tls-13-ssl-cipher-suite-v3`, `{"protocols":["TLSv1.2"]}` uses `oci-tls-12-ssl-cipher-suite-v3`, and `{"protocols":["TLSv1.2","TLSv1.3"]}` uses `oci-tls-12-13-ssl-cipher-suite-v3`. For an HTTP2 or GRPC listener, `{"protocols":["TLSv1.3"]}` uses `oci-default-http2-tls-13-ssl-cipher-suite-v1`, `{"protocols":["TLSv1.2"]}` uses `oci-default-http2-ssl-cipher-suite-v1`, and `{"protocols":["TLSv1.2","TLSv1.3"]}` uses `oci-default-http2-tls-12-13-ssl-cipher-suite-v1`. Backend-set protocols-only annotations use the same HTTP2-compatible cipher suite family: `oci-default-http2-tls-13-ssl-cipher-suite-v1` for `TLSv1.3`, `oci-default-http2-ssl-cipher-suite-v1` for `TLSv1.2`, and `oci-default-http2-tls-12-13-ssl-cipher-suite-v1` for `TLSv1.2` plus `TLSv1.3`.
-
-If a TLS policy annotation is absent and NIC creates new SSL configuration, NIC sends the locked default for that listener or backend set. If the annotation is absent and an OCI listener or backend set already has SSL configuration, NIC preserves existing requestable OCI `CipherSuiteName` and `Protocols` values and does not validate legacy protocol versions or unsafe-but-requestable preconfigured suite names. NIC rejects the OCI readback-only value `oci-customized-ssl-cipher-suite` before sending an update request because it is not requestable. OCI Load Balancer remains the final authority if it later rejects a preserved existing policy.
-
-For newly created listener or backend-set SSL configurations, NIC sends an explicit TLSv1.2/TLSv1.3 policy instead of relying on OCI Load Balancer service defaults; existing SSL configurations without policy annotations are preserved.
-
-Removing the TLS policy annotation does not clear SSL configuration or reset the policy to defaults. If TLS remains enabled, NIC preserves the existing OCI TLS policy. Do not use `{}` to clear SSL configuration; empty JSON objects are invalid for `listener-ssl-config` and `backendset-ssl-config` because these annotations must set at least one of `cipherSuiteName` or `protocols`.
-
-Removing listener TLS removes the listener `SslConfiguration`. For HTTP listeners, remove listener TLS inputs such as `spec.tls` or `oci-native-ingress.oraclecloud.com/certificate-ocid`; HTTP2 and GRPC listeners still require listener TLS. Disabling or removing backend TLS removes the backend-set `SslConfiguration`, for example by setting `oci-native-ingress.oraclecloud.com/backend-tls-enabled: "false"` or by removing backend TLS inputs. TLS policy annotations do not block those removal paths because the desired state is no SSL configuration.
-
-NIC validates TLS policy annotations before OCI mutations when they apply to an active TLS target. Invalid JSON, empty objects, unknown fields, empty values, duplicate logical fields with conflicting values, `TLSv1`, `TLSv1.0`, `TLSv1.1`, unsupported protocol strings, `oci-customized-ssl-cipher-suite`, and unsafe OCI preconfigured suite names fail reconciliation before listener or backend-set OCI updates are issued. Unsafe suite names currently include:
-
-- `oci-compatible-ssl-cipher-suite-v1`
-- `oci-wider-compatible-ssl-cipher-suite-v1`
-- `oci-tls-11-12-13-wider-ssl-cipher-suite-v1`
-
-The deprecated cipher names removed from OCI Load Balancer TLS policy support include `TLS_DHE_RSA_WITH_SEED_CBC_SHA`, `TLS_RSA_WITH_SEED_CBC_SHA`, `TLS_RSA_WITH_3DES_EDE_CBC_SHA`, `TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA`, `TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA`, `TLS_ECDHE_RSA_WITH_RC4_128_SHA`, `TLS_RSA_WITH_RC4_128_SHA`, `TLS_RSA_WITH_IDEA_CBC_SHA`, and `TLS_RSA_WITH_RC4_128_MD5`.
-
-When multiple ingresses share one listener or backend set, absent annotation fields mean no opinion. Complementary partial annotations can merge. Equivalent protocol sets do not conflict if they differ only by order. Different explicit values for the same field on the same listener or backend set fail deterministically with a warning event.
+NIC rejects invalid or unsupported policies before updating the load balancer. When multiple Ingress resources share a listener or backend set, their explicit TLS policy values must not conflict. Removing a TLS policy annotation preserves the existing TLS configuration; remove or disable the corresponding TLS input to remove TLS. Refer to the OCI Load Balancer documentation for supported protocols and cipher suites.
 
 HTTP/2 frontend listeners can be requested with:
 
