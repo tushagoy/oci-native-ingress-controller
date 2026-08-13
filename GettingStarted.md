@@ -38,8 +38,10 @@ The native ingress controller itself is lightweight process and pushes all the r
     + [TCP Listener Support](#tcp-listener-support)
     + [Cookie Session Persistence](#cookie-session-persistence)
     + [Network Security Groups Support](#network-security-groups-support)
+    + [Reserved Private IP Address](#reserved-private-ip-address)
     + [Tagging Support](#tagging-support)
       + [Default Tag Support](#default-tag-support)
+    + [Security Attributes (ZPR) Support](#security-attributes-zpr-support)
     + [Load Balancer Preservation on `IngressClass` delete](#load-balancer-preservation-on-ingressclass-delete)
   * [Dependency management](#dependency-management)
     + [How to introduce new modules or upgrade existing ones?](#how-to-introduce-new-modules-or-upgrade-existing-ones)
@@ -58,6 +60,10 @@ Currently supported kubernetes versions are:
 - 1.30
 - 1.31
 - 1.32
+- 1.33
+- 1.34
+- 1.35
+- 1.36
   
 We set up the cluster with either native pod networking or flannel CNI and update the security rules. 
 The documentation for NPN : [Doc Ref](https://docs.oracle.com/en-us/iaas/Content/ContEng/Concepts/contengpodnetworking_topic-OCI_CNI_plugin.htm).
@@ -731,6 +737,28 @@ metadata:
    oci-native-ingress.oraclecloud.com/network-security-group-ids: ocid1.networksecuritygroup.oc1.abc,ocid1.networksecuritygroup.oc1.xyz
 ```
 
+### Reserved Private IP Address
+Starting with OCI Native Ingress Controller version `1.4.5`, a private load balancer can use an existing reserved private IPv4 address. Set `IngressClassParameters.spec.isPrivate` to `true` and add the reserved private IP OCID to the `IngressClass`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: private-ingress-class
+  annotations:
+    oci-native-ingress.oraclecloud.com/reserved-private-ip-address-id: ocid1.privateip.oc1.iad.example
+spec:
+  controller: oci.oraclecloud.com/native-ingress-controller
+  parameters:
+    scope: Namespace
+    namespace: test
+    apiGroup: ingress.oraclecloud.com
+    kind: ingressclassparameters
+    name: ingressparms-cr-test
+```
+
+The annotation must reference a reserved private IPv4 address. Ephemeral private IP addresses, IPv6 addresses, and public load balancers are not supported. The reserved public and private IP settings cannot be changed after the load balancer is created.
+
 ### Tagging Support
 Users can use the following optional `IngressClass` resource annotations to apply defined and freeform tags to LBs managed by OCI NIC.
 The JSON strings should be wrapped in single quotes. They default to `'{}'` if not specified or empty.
@@ -760,6 +788,22 @@ Note that 'User-Applied' type of default tags must be overriden on creation of `
 
 For LoadBalancers created by NIC version `< v1.4.0`, and for LoadBalancers imported by using `oci-native-ingress.oraclecloud.com/id`,
 default tag support is not available. All tags present on such LoadBalancers must be added to the tag annotations specified above.
+
+### Security Attributes (ZPR) Support
+Starting with OCI Native Ingress Controller version `1.4.5`, security attributes used by Zero Trust Packet Routing (ZPR) can be applied to a load balancer through the `IngressClass` annotation `oci-native-ingress.oraclecloud.com/security-attributes`. The value must be a JSON object keyed by security attribute namespace and name.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: default-ingress-class
+  annotations:
+    oci-native-ingress.oraclecloud.com/security-attributes: '{"<security-attribute-namespace>":{"<security-attribute-name>":{"value":"<value>","mode":"enforce"}}}'
+spec:
+  controller: oci.oraclecloud.com/native-ingress-controller
+```
+
+NIC applies the security attributes when it creates the load balancer and reconciles changes to the annotation on an existing load balancer. Removing the annotation clears security attributes previously managed through it. Invalid JSON causes reconciliation to fail before the load balancer is updated. The controller principal must have the OCI permissions required to assign the specified security attributes.
 
 ### Load Balancer Preservation on `IngressClass` delete
 If you want the Load Balancer associated with an `IngressClass` resource to be preserved after `IngressClass` is deleted,
