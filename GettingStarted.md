@@ -38,8 +38,10 @@ The native ingress controller itself is lightweight process and pushes all the r
     + [TCP Listener Support](#tcp-listener-support)
     + [Cookie Session Persistence](#cookie-session-persistence)
     + [Network Security Groups Support](#network-security-groups-support)
+    + [Reserved Private IP Address](#reserved-private-ip-address)
     + [Tagging Support](#tagging-support)
       + [Default Tag Support](#default-tag-support)
+    + [Security Attributes (ZPR) Support](#security-attributes-zpr-support)
     + [Load Balancer Preservation on `IngressClass` delete](#load-balancer-preservation-on-ingressclass-delete)
   * [Dependency management](#dependency-management)
     + [How to introduce new modules or upgrade existing ones?](#how-to-introduce-new-modules-or-upgrade-existing-ones)
@@ -58,6 +60,10 @@ Currently supported kubernetes versions are:
 - 1.30
 - 1.31
 - 1.32
+- 1.33
+- 1.34
+- 1.35
+- 1.36
   
 We set up the cluster with either native pod networking or flannel CNI and update the security rules. 
 The documentation for NPN : [Doc Ref](https://docs.oracle.com/en-us/iaas/Content/ContEng/Concepts/contengpodnetworking_topic-OCI_CNI_plugin.htm).
@@ -456,13 +462,48 @@ testecho-7cdcfff87f-b6xt4                        1/1     Running   0          72
 ```
 
 #### HTTPS/TLS Support
-We will be able to configure ingress routes those are HTTPS enabled. Customers can use a Kubernetes secret (TLS) or a certificate from certificate service.
+We can configure HTTPS-enabled ingress routes using Kubernetes TLS secrets, OCI certificate OCIDs, or both.
 
 - The controller will appropriately configure both listener and backend sets with provided credentials.
 - In the case of Kubernetes secret we create a certificate service certificate and a ca bundle to configure the listener and backend set appropriately.
-- In the case of certificates we use the certificate Id and certificate trust authority Id to configure listener and backend set.
+- In the case of direct OCI certificates we use `oci-native-ingress.oraclecloud.com/certificate-ocid` to configure listener SSL termination.
+- `oci-native-ingress.oraclecloud.com/certificate-ocid` accepts a comma-separated list so multiple certificates can be attached to one listener.
+- Multiple `spec.tls` secrets that map to one listener are aggregated into one listener SSL configuration.
 - Customer can use the same credentials in their pods to make this an end to end SSL support.
 - If the customer wishes to terminate TLS on the LB and run plain text (HTTP) backend, they can use the annotation `oci-native-ingress.oraclecloud.com/backend-tls-enabled: "false"` on the Ingress
+- In tenancies or regions where OCI LB multi-certificate listeners are not enabled, NIC surfaces an actionable reconcile error and warning event and does not fall back to a multi-listener workaround.
+
+##### TLS policy annotations
+NIC supports optional ingress annotations for the OCI Load Balancer listener and backend-set TLS policy:
+
+```yaml
+metadata:
+  annotations:
+    oci-native-ingress.oraclecloud.com/listener-ssl-config: '{"cipherSuiteName":"oci-tls-12-13-ssl-cipher-suite-v3","protocols":["TLSv1.2","TLSv1.3"]}'
+    oci-native-ingress.oraclecloud.com/backendset-ssl-config: '{"cipherSuiteName":"oci-default-http2-tls-12-13-ssl-cipher-suite-v1","protocols":["TLSv1.2","TLSv1.3"]}'
+```
+
+Each annotation accepts a JSON object with `cipherSuiteName`, `protocols`, or both. These annotations customize TLS that is already configured through `spec.tls`, `oci-native-ingress.oraclecloud.com/certificate-ocid`, or backend TLS settings; they do not enable TLS by themselves. When a field is omitted, NIC selects a compatible default. New TLS configurations default to TLS 1.2 and TLS 1.3.
+
+NIC rejects invalid or unsupported policies before updating the load balancer. When multiple Ingress resources share a listener or backend set, their explicit TLS policy values must not conflict. Removing a TLS policy annotation preserves the existing TLS configuration; remove or disable the corresponding TLS input to remove TLS. Refer to the OCI Load Balancer documentation for supported protocols and cipher suites.
+
+HTTP/2 frontend listeners can be requested with:
+
+```yaml
+metadata:
+  annotations:
+    oci-native-ingress.oraclecloud.com/protocol: HTTP2
+```
+
+gRPC frontend listeners can be requested with:
+
+```yaml
+metadata:
+  annotations:
+    oci-native-ingress.oraclecloud.com/protocol: GRPC
+```
+
+gRPC listeners require listener TLS configuration, so configure `spec.tls` or `oci-native-ingress.oraclecloud.com/certificate-ocid` on the Ingress. Backend TLS remains enabled by default.
 
 ##### Sample configuration : Using Secret
 We create OCI certificate service certificates and cabundles for each kubernetes secret. Hence the content of the secret (ca.crt, tls.crt, tls.key) should conform to the certificate service standards.
@@ -513,14 +554,14 @@ spec:
 ```
 
 ##### Sample configuration : Using Certificate
-Certificate should have the common name of the host specified.
+Certificate should have the common name of the host specified. For multi-certificate listeners, provide a comma-separated list.
 ```
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: ingress-tls
   annotations:
-    oci-native-ingress.oraclecloud.com/certificate-ocid: ocid1.certificate.oc1.iad.amaaaaaah4gjgpyaxlby5qciob5wnwa7cnm4brvq2tfta3ls6ngch3s6gabc
+    oci-native-ingress.oraclecloud.com/certificate-ocid: ocid1.certificate.oc1.iad.<cert-a>,ocid1.certificate.oc1.iad.<cert-b>
 spec:
   rules:
   - host: "*.bar.com"
@@ -650,6 +691,28 @@ metadata:
    oci-native-ingress.oraclecloud.com/network-security-group-ids: ocid1.networksecuritygroup.oc1.abc,ocid1.networksecuritygroup.oc1.xyz
 ```
 
+### Reserved Private IP Address
+Starting with OCI Native Ingress Controller version `1.4.5`, a private load balancer can use an existing reserved private IPv4 address. Set `IngressClassParameters.spec.isPrivate` to `true` and add the reserved private IP OCID to the `IngressClass`:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: private-ingress-class
+  annotations:
+    oci-native-ingress.oraclecloud.com/reserved-private-ip-address-id: ocid1.privateip.oc1.iad.example
+spec:
+  controller: oci.oraclecloud.com/native-ingress-controller
+  parameters:
+    scope: Namespace
+    namespace: test
+    apiGroup: ingress.oraclecloud.com
+    kind: ingressclassparameters
+    name: ingressparms-cr-test
+```
+
+The annotation must reference a reserved private IPv4 address. Ephemeral private IP addresses, IPv6 addresses, and public load balancers are not supported. The reserved public and private IP settings cannot be changed after the load balancer is created.
+
 ### Tagging Support
 Users can use the following optional `IngressClass` resource annotations to apply defined and freeform tags to LBs managed by OCI NIC.
 The JSON strings should be wrapped in single quotes. They default to `'{}'` if not specified or empty.
@@ -679,6 +742,22 @@ Note that 'User-Applied' type of default tags must be overriden on creation of `
 
 For LoadBalancers created by NIC version `< v1.4.0`, and for LoadBalancers imported by using `oci-native-ingress.oraclecloud.com/id`,
 default tag support is not available. All tags present on such LoadBalancers must be added to the tag annotations specified above.
+
+### Security Attributes (ZPR) Support
+Starting with OCI Native Ingress Controller version `1.4.5`, security attributes used by Zero Trust Packet Routing (ZPR) can be applied to a load balancer through the `IngressClass` annotation `oci-native-ingress.oraclecloud.com/security-attributes`. The value must be a JSON object keyed by security attribute namespace and name.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: default-ingress-class
+  annotations:
+    oci-native-ingress.oraclecloud.com/security-attributes: '{"<security-attribute-namespace>":{"<security-attribute-name>":{"value":"<value>","mode":"enforce"}}}'
+spec:
+  controller: oci.oraclecloud.com/native-ingress-controller
+```
+
+NIC applies the security attributes when it creates the load balancer and reconciles changes to the annotation on an existing load balancer. Removing the annotation clears security attributes previously managed through it. Invalid JSON causes reconciliation to fail before the load balancer is updated. The controller principal must have the OCI permissions required to assign the specified security attributes.
 
 ### Load Balancer Preservation on `IngressClass` delete
 If you want the Load Balancer associated with an `IngressClass` resource to be preserved after `IngressClass` is deleted,
@@ -715,7 +794,7 @@ All changes to those modules should be reflected in the remote VCS repository.
 
 ### Known Issues
 1. The loadbalancer has a limitation of 16 backend sets per load balancer. We create a backend set for every unique service and port combination. So if a customer has more such services they need to have new load balancers.
-2. Each service port is mapped to a load balancer listener. For SSL configuration customer can specify only one key pair per listener which would be used for SSL termination. All the backend sets that are mapped to the listener will use the same issuer(CA Bundle) as the issuer of listener certificate. Any conflicting declarations across ingress resources for same listener will throw a validation error which will be logged in controller logs.
+2. Each service port is mapped to one load balancer listener. Listener SSL configuration can include multiple certificates (from multiple `spec.tls` secrets and/or comma-separated direct certificate OCIDs). In this feature path, HTTP, HTTP/2, and gRPC multi-certificate listeners use `oci-tls-12-13-ssl-cipher-suite-v3` with `TLSv1.2` and `TLSv1.3`. In tenancies or regions where OCI LB multi-certificate listener capability is not enabled, multi-certificate requests are rejected by OCI LB and surfaced by NIC as actionable reconcile errors and warning events.
 3. Any conflicting declarations for same backend set health checker and routing policy across ingress resources will throw a validation error which will be logged in controller logs.
 4. For supporting ssl through kubernetes secrets, we generate respective certificates and ca bundles in certificate service. If we delete ingress resource, currently we only delete the load balancer resources.
 The certificates need to be cleared by the customer.

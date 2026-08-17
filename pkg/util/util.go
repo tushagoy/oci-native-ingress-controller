@@ -63,9 +63,10 @@ const (
 
 	IngressListenerTlsCertificateAnnotation = "oci-native-ingress.oraclecloud.com/certificate-ocid"
 	IngressBackendTlsEnabledAnnotation      = "oci-native-ingress.oraclecloud.com/backend-tls-enabled"
+	IngressListenerSslConfigAnnotation      = "oci-native-ingress.oraclecloud.com/listener-ssl-config"
+	IngressBackendSetSslConfigAnnotation    = "oci-native-ingress.oraclecloud.com/backendset-ssl-config"
 
-	// IngressProtocolAnntoation - HTTP only for now
-	// HTTP, HTTP2, TCP - accepted.
+	// IngressProtocolAnnotation - HTTP, HTTP2, GRPC, TCP are accepted.
 	IngressProtocolAnnotation = "oci-native-ingress.oraclecloud.com/protocol"
 
 	IngressPolicyAnnotation                       = "oci-native-ingress.oraclecloud.com/policy"
@@ -76,6 +77,10 @@ const (
 	IngressClassDefinedTagsAnnotation             = "oci-native-ingress.oraclecloud.com/defined-tags"
 	IngressClassFreeformTagsAnnotation            = "oci-native-ingress.oraclecloud.com/freeform-tags"
 	IngressClassImplicitDefaultTagsAnnotation     = "oci-native-ingress.oraclecloud.com/implicit-default-tags"
+	IngressClassSecurityAttributesAnnotation      = "oci-native-ingress.oraclecloud.com/security-attributes"
+	IngressClassReservedPrivateIpAnnotation       = "oci-native-ingress.oraclecloud.com/reserved-private-ip-address-id"
+	OcidResourceTypePrivateIP                     = "privateip"
+	OcidResourceTypeIPv6                          = "ipv6"
 
 	IngressHealthCheckProtocolAnnotation             = "oci-native-ingress.oraclecloud.com/healthcheck-protocol"
 	IngressHealthCheckPortAnnotation                 = "oci-native-ingress.oraclecloud.com/healthcheck-port"
@@ -97,7 +102,8 @@ const (
 	ProtocolTCP                            = "TCP"
 	ProtocolHTTP                           = "HTTP"
 	ProtocolHTTP2                          = "HTTP2"
-	ProtocolHTTP2DefaultCipherSuite        = "oci-default-http2-ssl-cipher-suite-v1"
+	ProtocolGRPC                           = "GRPC"
+	ProtocolHTTP2DefaultCipherSuite        = "oci-default-http2-tls-12-13-ssl-cipher-suite-v1"
 	DefaultBackendSetName                  = "default_ingress"
 	DefaultHealthCheckProtocol             = ProtocolTCP
 	DefaultHealthCheckPort                 = 0
@@ -190,6 +196,38 @@ func GetIngressClassFireWallId(ic *networkingv1.IngressClass) string {
 	}
 
 	return value
+}
+
+func GetIngressClassReservedPrivateIpAddressId(ic *networkingv1.IngressClass) (string, error) {
+	annotation := IngressClassReservedPrivateIpAnnotation
+	value, ok := ic.Annotations[annotation]
+	if !ok {
+		return "", nil
+	}
+
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "", fmt.Errorf("ingress class annotation %s must not be empty", annotation)
+	}
+
+	return trimmed, nil
+}
+
+// GetOcidResourceType returns the resource type segment from an OCI OCID.
+// It returns an error when the OCID is empty or does not match the expected
+// ocid1.<resourceType>.<realm>... format.
+func GetOcidResourceType(ocid string) (string, error) {
+	trimmed := strings.TrimSpace(ocid)
+	if trimmed == "" {
+		return "", fmt.Errorf("OCID must not be empty")
+	}
+
+	parts := strings.Split(trimmed, ".")
+	if len(parts) < 4 || parts[0] != "ocid1" || parts[1] == "" || parts[2] == "" {
+		return "", fmt.Errorf("invalid OCID format")
+	}
+
+	return parts[1], nil
 }
 
 func GetIngressClassNetworkSecurityGroupIds(ic *networkingv1.IngressClass) []string {
@@ -286,6 +324,22 @@ func GetIngressClassFreeformTags(ic *networkingv1.IngressClass) (map[string]stri
 	return freeformTags, nil
 }
 
+// GetSecurityAttributes parses the security attributes annotation. A missing or
+// empty annotation means no security attributes are desired.
+func GetSecurityAttributes(ic *networkingv1.IngressClass) (map[string]map[string]interface{}, error) {
+	value, ok := ic.Annotations[IngressClassSecurityAttributesAnnotation]
+	if !ok || strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	securityAttributes := map[string]map[string]interface{}{}
+	if err := json.Unmarshal([]byte(value), &securityAttributes); err != nil {
+		return nil, errors.Wrap(err, "failed to parse security attributes annotation")
+	}
+
+	return securityAttributes, nil
+}
+
 func GetIngressProtocol(i *networkingv1.Ingress) string {
 	protocol, ok := i.Annotations[IngressProtocolAnnotation]
 	if !ok {
@@ -303,12 +357,23 @@ func GetIngressClassLoadBalancerId(ic *networkingv1.IngressClass) string {
 	return id
 }
 
-func GetListenerTlsCertificateOcid(i *networkingv1.Ingress) *string {
+func GetListenerTlsCertificateOcids(i *networkingv1.Ingress) []string {
 	value, ok := i.Annotations[IngressListenerTlsCertificateAnnotation]
 	if !ok {
 		return nil
 	}
-	return &value
+
+	ocids := make([]string, 0)
+	seen := sets.NewString()
+	for _, entry := range strings.Split(value, ",") {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" || seen.Has(trimmed) {
+			continue
+		}
+		seen.Insert(trimmed)
+		ocids = append(ocids, trimmed)
+	}
+	return ocids
 }
 
 func GetBackendTlsEnabled(i *networkingv1.Ingress) bool {
@@ -953,7 +1018,7 @@ func DetermineListenerPort(ingress *networkingv1.Ingress, tlsConfiguredHosts *se
 		return 0, fmt.Errorf("error parsing Ingress Https Listener Port: %w", err)
 	}
 
-	isCertOcidPresent := GetListenerTlsCertificateOcid(ingress) != nil
+	isCertOcidPresent := len(GetListenerTlsCertificateOcids(ingress)) > 0
 
 	listenerPort := servicePort
 	if isCertOcidPresent || tlsConfiguredHosts.Has(host) {
@@ -980,6 +1045,19 @@ func IsBackendServiceEqual(b1 *networkingv1.IngressBackend, b2 *networkingv1.Ing
 
 func IsIngressProtocolTCP(ingress *networkingv1.Ingress) bool {
 	return GetIngressProtocol(ingress) == ProtocolTCP
+}
+
+func IsIngressProtocolHTTPBased(ingress *networkingv1.Ingress) bool {
+	protocol := GetIngressProtocol(ingress)
+	return protocol == ProtocolHTTP || protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
+}
+
+func IsListenerProtocolTLSRequired(protocol string) bool {
+	return protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
+}
+
+func IsListenerProtocolUsingHTTP2CipherSuite(protocol string) bool {
+	return protocol == ProtocolHTTP2 || protocol == ProtocolGRPC
 }
 
 // StringSlicesHaveSameElements checks if s1 and s2 have the same elements, ignoring order and duplicates.

@@ -2,9 +2,6 @@ package nodeBackend
 
 import (
 	"context"
-	"github.com/prometheus/client_golang/prometheus"
-	coreinformers "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/tools/events"
 	"sync"
 	"testing"
 	"time"
@@ -17,13 +14,16 @@ import (
 	"github.com/oracle/oci-native-ingress-controller/pkg/metric"
 	ociclient "github.com/oracle/oci-native-ingress-controller/pkg/oci/client"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
+	coreinformers "k8s.io/client-go/informers/core/v1"
 	networkinginformers "k8s.io/client-go/informers/networking/v1"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/tools/events"
 
 	"k8s.io/client-go/tools/cache"
 )
@@ -217,7 +217,7 @@ func inits(ctx context.Context, ingressClassList *networkingv1.IngressClassList,
 	}
 
 	ingressClassInformer, ingressInformer, saInformer, serviceLister, endpointLister, podLister, nodeLister, k8client := setUp(ctx, ingressClassList, ingressList, testService, endpoints, pod, nodes)
-	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, nil)
+	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, nil, nil)
 	mockClient := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},

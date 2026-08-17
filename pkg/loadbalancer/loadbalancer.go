@@ -17,11 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
-
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/loadbalancer"
+	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
 	"github.com/oracle/oci-native-ingress-controller/pkg/oci/client"
+	"github.com/oracle/oci-native-ingress-controller/pkg/tlspolicy"
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -38,6 +38,20 @@ type LoadBalancerClient struct {
 
 	Mu    sync.Mutex
 	Cache map[string]*LbCacheObj
+}
+
+const multiCertificateCapabilityErrorMessage = "OCI Load Balancer multi-certificate listeners may not be supported in this tenancy or region; verify enablement or use one certificate"
+
+type multiCertificateCapabilityError struct {
+	cause error
+}
+
+func (e *multiCertificateCapabilityError) Error() string {
+	return multiCertificateCapabilityErrorMessage
+}
+
+func (e *multiCertificateCapabilityError) Unwrap() error {
+	return e.cause
 }
 
 func New(lbClient *loadbalancer.LoadBalancerClient) *LoadBalancerClient {
@@ -142,19 +156,23 @@ func (lbc *LoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, req 
 }
 
 func (lbc *LoadBalancerClient) UpdateLoadBalancer(ctx context.Context, lbId string, displayName string, definedTags map[string]map[string]interface{},
-	freeformTags map[string]string) (*loadbalancer.LoadBalancer, error) {
-	_, etag, err := lbc.GetLoadBalancer(ctx, lbId)
+	freeformTags map[string]string, securityAttributes map[string]map[string]interface{}) (*loadbalancer.LoadBalancer, error) {
+	lb, etag, err := lbc.GetLoadBalancer(ctx, lbId)
 	if err != nil {
 		return nil, err
+	}
+	if securityAttributes == nil && lb.SecurityAttributes != nil {
+		securityAttributes = map[string]map[string]interface{}{}
 	}
 
 	req := loadbalancer.UpdateLoadBalancerRequest{
 		LoadBalancerId: common.String(lbId),
 		IfMatch:        common.String(etag),
 		UpdateLoadBalancerDetails: loadbalancer.UpdateLoadBalancerDetails{
-			DisplayName:  common.String(displayName),
-			DefinedTags:  definedTags,
-			FreeformTags: freeformTags,
+			DisplayName:        common.String(displayName),
+			DefinedTags:        definedTags,
+			FreeformTags:       freeformTags,
+			SecurityAttributes: securityAttributes,
 		},
 	}
 
@@ -173,7 +191,7 @@ func (lbc *LoadBalancerClient) UpdateLoadBalancer(ctx context.Context, lbId stri
 		return nil, err
 	}
 
-	lb, _, err := lbc.getLoadBalancerBustCache(ctx, lbID)
+	lb, _, err = lbc.getLoadBalancerBustCache(ctx, lbID)
 	return lb, err
 }
 
@@ -204,6 +222,11 @@ func (lbc *LoadBalancerClient) GetLoadBalancer(ctx context.Context, lbID string)
 		klog.Infof("Refreshing LB cache for lb %s ", lbID)
 	}
 
+	return lbc.getLoadBalancerBustCache(ctx, lbID)
+}
+
+// RefreshLoadBalancer bypasses the local cache and stores the fresh load balancer response.
+func (lbc *LoadBalancerClient) RefreshLoadBalancer(ctx context.Context, lbID string) (*loadbalancer.LoadBalancer, string, error) {
 	return lbc.getLoadBalancerBustCache(ctx, lbID)
 }
 
@@ -574,11 +597,9 @@ func (lbc *LoadBalancerClient) UpdateBackends(ctx context.Context, lbID string, 
 		return nil
 	}
 
-	var sslConfig *loadbalancer.SslConfigurationDetails
-	if backendSet.SslConfiguration != nil {
-		sslConfig = &loadbalancer.SslConfigurationDetails{
-			TrustedCertificateAuthorityIds: backendSet.SslConfiguration.TrustedCertificateAuthorityIds,
-		}
+	sslConfig, err := backendSetSslConfigurationDetailsFromCurrent(backendSet.SslConfiguration)
+	if err != nil {
+		return err
 	}
 
 	healthCheckerDetails := &loadbalancer.HealthCheckerDetails{
@@ -605,6 +626,13 @@ func (lbc *LoadBalancerClient) UpdateBackendSetDetails(ctx context.Context, lbID
 	healthCheckerDetails *loadbalancer.HealthCheckerDetails, policy string,
 	appCookie *loadbalancer.SessionPersistenceConfigurationDetails,
 	lbCookie *loadbalancer.LbCookieSessionPersistenceConfigurationDetails) error {
+	if sslConfig != nil {
+		var err error
+		sslConfig, err = backendSetSslConfigurationDetailsWithPreservedPolicy(sslConfig, backendSet.SslConfiguration)
+		if err != nil {
+			return err
+		}
+	}
 
 	backends := make([]loadbalancer.BackendDetails, len(backendSet.Backends))
 	for i := range backendSet.Backends {
@@ -691,15 +719,83 @@ func (lbc *LoadBalancerClient) setRoutingPolicyOnListener(
 		return exception.NewTransientError(fmt.Errorf("listener %s not found", routingPolicyName))
 	}
 
-	return lbc.UpdateListener(ctx, lb.Id, etag, l, &routingPolicyName, nil, l.Protocol, nil, true)
+	return lbc.UpdateListener(ctx, lb.Id, etag, l, &routingPolicyName, nil, l.Protocol, nil)
+}
+
+func listenerSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if current == nil {
+		return nil, nil
+	}
+	if err := tlspolicy.EnsureRequestableCipherSuite("listener", current.CipherSuiteName); err != nil {
+		return nil, err
+	}
+	return &loadbalancer.SslConfigurationDetails{
+		CertificateIds:  current.CertificateIds,
+		CipherSuiteName: current.CipherSuiteName,
+		Protocols:       current.Protocols,
+	}, nil
+}
+
+func backendSetSslConfigurationDetailsFromCurrent(current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if current == nil {
+		return nil, nil
+	}
+	if err := tlspolicy.EnsureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+		return nil, err
+	}
+	return &loadbalancer.SslConfigurationDetails{
+		TrustedCertificateAuthorityIds: current.TrustedCertificateAuthorityIds,
+		CipherSuiteName:                current.CipherSuiteName,
+		Protocols:                      current.Protocols,
+	}, nil
+}
+
+func backendSetSslConfigurationDetailsWithPreservedPolicy(desired *loadbalancer.SslConfigurationDetails,
+	current *loadbalancer.SslConfiguration) (*loadbalancer.SslConfigurationDetails, error) {
+	if desired == nil || current == nil {
+		return desired, nil
+	}
+	if desired.CipherSuiteName == nil && current.CipherSuiteName != nil {
+		if err := tlspolicy.EnsureRequestableCipherSuite("backend set", current.CipherSuiteName); err != nil {
+			return nil, err
+		}
+		desired.CipherSuiteName = current.CipherSuiteName
+	}
+	if len(desired.Protocols) == 0 {
+		desired.Protocols = current.Protocols
+	}
+	return desired, nil
 }
 
 func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
-	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string, preserveExistingSslConfig bool) error {
+	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string) error {
+	return lbc.updateListener(ctx, lbId, etag, l, routingPolicyName, sslConfigurationDetails, protocol, defaultBackendSet, true)
+}
 
-	if preserveExistingSslConfig && sslConfigurationDetails == nil && l.SslConfiguration != nil {
-		sslConfigurationDetails = &loadbalancer.SslConfigurationDetails{
-			CertificateIds: l.SslConfiguration.CertificateIds,
+func (lbc *LoadBalancerClient) ClearListenerSSL(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
+	protocol *string, defaultBackendSet *string) error {
+	effectiveProtocol := protocol
+	if effectiveProtocol == nil || *effectiveProtocol == "" {
+		effectiveProtocol = l.Protocol
+	}
+	if effectiveProtocol != nil && util.IsListenerProtocolTLSRequired(*effectiveProtocol) {
+		listenerName := "unknown"
+		if l.Name != nil {
+			listenerName = *l.Name
+		}
+		return fmt.Errorf("TLSPolicyUnsupported: cannot clear TLS from %s listener %s", *effectiveProtocol, listenerName)
+	}
+	return lbc.updateListener(ctx, lbId, etag, l, routingPolicyName, nil, protocol, defaultBackendSet, false)
+}
+
+func (lbc *LoadBalancerClient) updateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
+	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string, preserveExistingSSL bool) error {
+
+	if preserveExistingSSL && sslConfigurationDetails == nil && l.SslConfiguration != nil {
+		var err error
+		sslConfigurationDetails, err = listenerSslConfigurationDetailsFromCurrent(l.SslConfiguration)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -709,13 +805,6 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 
 	if defaultBackendSet == nil || *defaultBackendSet == "" {
 		defaultBackendSet = l.DefaultBackendSetName
-	}
-
-	if *protocol == util.ProtocolHTTP2 {
-		if sslConfigurationDetails == nil {
-			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", *l.Port)
-		}
-		sslConfigurationDetails.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
 	updateListenerRequest := loadbalancer.UpdateListenerRequest{
@@ -741,7 +830,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 	}
 
 	if err != nil {
-		return err
+		return wrapMultiCertificateCapabilityError(err, "UpdateListener", l.Name, sslConfigurationDetails)
 	}
 
 	// Safe logging without nil deref
@@ -760,7 +849,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 	klog.Infof("Update listener response: name: %s, work request id: %s, opc request id: %s.", lname, wrID, opcID)
 	if resp.OpcWorkRequestId != nil {
 		_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
-		return err
+		return wrapMultiCertificateCapabilityError(err, "UpdateListener", l.Name, sslConfigurationDetails)
 	}
 	// If mock or backend didn't return a work request id, treat as completed.
 	return nil
@@ -782,12 +871,10 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 		return nil
 	}
 
-	if listenerProtocol == util.ProtocolHTTP2 {
+	if util.IsListenerProtocolTLSRequired(listenerProtocol) {
 		if sslConfig == nil {
-			return fmt.Errorf("no TLS configuration provided for a HTTP2 listener at port %d", listenerPort)
+			return fmt.Errorf("no TLS configuration provided for a %s listener at port %d", listenerProtocol, listenerPort)
 		}
-
-		sslConfig.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
 	createListenerRequest := loadbalancer.CreateListenerRequest{
@@ -804,18 +891,58 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 	klog.Infof("Creating listener with request %s", util.PrettyPrint(createListenerRequest))
 	resp, err := lbc.LbClient.CreateListener(ctx, createListenerRequest)
 
-	if util.IsServiceError(err, 409) {
+	if isListenerAlreadyExistsError(err) {
 		klog.Infof("Create listener operation returned code %d for load balancer %s. Listener %s may be already present.", 409, lbID, listenerName)
-		return nil
+		if _, _, refreshErr := lbc.getLoadBalancerBustCache(ctx, lbID); refreshErr != nil {
+			return exception.NewTransientError(fmt.Errorf("listener %s may already be present in load balancer %s, and refresh failed: %w", listenerName, lbID, refreshErr))
+		}
+		return exception.NewTransientError(fmt.Errorf("listener %s may already be present in load balancer %s: %w", listenerName, lbID, err))
 	}
 
 	if err != nil {
-		return err
+		return wrapMultiCertificateCapabilityError(err, "CreateListener", common.String(listenerName), sslConfig)
 	}
 
 	klog.Infof("Create listener response: name: %s, work request id: %s, opc request id: %s.", listenerName, *resp.OpcWorkRequestId, *resp.OpcRequestId)
 	_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
-	return err
+	return wrapMultiCertificateCapabilityError(err, "CreateListener", common.String(listenerName), sslConfig)
+}
+
+func isListenerAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if util.IsServiceError(err, 409) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "already has listener") || strings.Contains(message, "listener already exists")
+}
+
+func wrapMultiCertificateCapabilityError(err error, operation string, listenerName *string, sslConfigurationDetails *loadbalancer.SslConfigurationDetails) error {
+	if err == nil || sslConfigurationDetails == nil || len(sslConfigurationDetails.CertificateIds) <= 1 {
+		return err
+	}
+
+	svcErr, hasServiceError := common.IsServiceError(err)
+	isCandidateCapabilityError := strings.Contains(err.Error(), "work request failed")
+	if hasServiceError {
+		statusCode := svcErr.GetHTTPStatusCode()
+		isCandidateCapabilityError = isCandidateCapabilityError || statusCode == 400 || statusCode == 403 || statusCode == 422
+	}
+
+	if !isCandidateCapabilityError {
+		return err
+	}
+
+	resolvedListenerName := "unknown"
+	if listenerName != nil && *listenerName != "" {
+		resolvedListenerName = *listenerName
+	}
+
+	klog.Warningf("%s failed for listener %s with %d certificates; OCI LB multi-cert capability may be unavailable: %v",
+		operation, resolvedListenerName, len(sslConfigurationDetails.CertificateIds), err)
+	return &multiCertificateCapabilityError{cause: err}
 }
 
 func (lbc *LoadBalancerClient) waitForWorkRequest(ctx context.Context, workRequestID string) (string, error) {
@@ -831,7 +958,9 @@ func (lbc *LoadBalancerClient) waitForWorkRequest(ctx context.Context, workReque
 		}
 
 		if resp.LifecycleState == loadbalancer.WorkRequestLifecycleStateSucceeded {
-			lbc.getLoadBalancerBustCache(ctx, *resp.LoadBalancerId)
+			if _, _, err := lbc.getLoadBalancerBustCache(ctx, *resp.LoadBalancerId); err != nil {
+				klog.Warningf("Unable to refresh load balancer cache after work request %s succeeded: %v", workRequestID, err)
+			}
 			return *resp.LoadBalancerId, nil
 		}
 

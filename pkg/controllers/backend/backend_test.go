@@ -254,7 +254,7 @@ func inits(ctx context.Context, ingressClassList *networkingv1.IngressClassList,
 	}
 
 	ingressClassInformer, ingressInformer, saInformer, serviceLister, endpointLister, podLister, k8client := setUp(ctx, ingressClassList, ingressList, testService, endpoints, pod)
-	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, nil)
+	wrapperClient := client.NewWrapperClient(k8client, nil, loadBalancerClient, nil, nil, nil)
 	client := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},

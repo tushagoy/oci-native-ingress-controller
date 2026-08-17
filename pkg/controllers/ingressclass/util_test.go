@@ -31,6 +31,43 @@ func TestIsDefinedTagsEqual(t *testing.T) {
 	Expect(isDefinedTagsEqual(dt2, dt3)).Should(BeFalse())
 }
 
+func TestIsSecurityAttributesEqual(t *testing.T) {
+	RegisterTestingT(t)
+
+	empty := map[string]map[string]interface{}{}
+	attributes := map[string]map[string]interface{}{
+		"Oracle-ZPR": {
+			"MaxEgressCount": map[string]interface{}{
+				"value": "42",
+				"mode":  "enforce",
+			},
+		},
+	}
+	matching := map[string]map[string]interface{}{
+		"Oracle-ZPR": {
+			"MaxEgressCount": map[string]interface{}{
+				"value": "42",
+				"mode":  "enforce",
+			},
+		},
+	}
+	different := map[string]map[string]interface{}{
+		"Oracle-ZPR": {
+			"MaxEgressCount": map[string]interface{}{
+				"value": "43",
+				"mode":  "enforce",
+			},
+		},
+	}
+
+	Expect(isSecurityAttributesEqual(nil, empty)).Should(BeTrue())
+	Expect(isSecurityAttributesEqual(empty, nil)).Should(BeTrue())
+	Expect(isSecurityAttributesEqual(nil, attributes)).Should(BeFalse())
+	Expect(isSecurityAttributesEqual(empty, attributes)).Should(BeFalse())
+	Expect(isSecurityAttributesEqual(attributes, matching)).Should(BeTrue())
+	Expect(isSecurityAttributesEqual(attributes, different)).Should(BeFalse())
+}
+
 func TestGetImplicitDefaultTagsForNewLoadBalancer(t *testing.T) {
 	RegisterTestingT(t)
 

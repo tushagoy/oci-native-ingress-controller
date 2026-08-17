@@ -140,7 +140,7 @@ func inits() (context.Context, *certificate.CertificatesClient) {
 		CaBundleCache:      map[string]*ociclient.CaBundleCacheObj{},
 	}
 
-	wrapperClient := client.NewWrapperClient(nil, nil, nil, certificatesClient, nil)
+	wrapperClient := client.NewWrapperClient(nil, nil, nil, nil, certificatesClient, nil)
 	fakeClient := &client.ClientProvider{
 		K8sClient:           nil,
 		DefaultConfigGetter: &MockConfigGetter{},
@@ -172,7 +172,7 @@ func TestRun(t *testing.T) {
 	cache.WaitForCacheSync(context.TODO().Done(), saInformer.Informer().HasSynced)
 
 	_, certClient := inits()
-	wrapperClient := client.NewWrapperClient(fakeClient, nil, nil, certClient, nil)
+	wrapperClient := client.NewWrapperClient(fakeClient, nil, nil, nil, certClient, nil)
 	client := &client.ClientProvider{
 		K8sClient:           fakeClient,
 		DefaultConfigGetter: &MockConfigGetter{},

@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -24,7 +25,6 @@ import (
 	"k8s.io/client-go/tools/events"
 
 	"github.com/oracle/oci-native-ingress-controller/pkg/exception"
-	corev1 "k8s.io/api/core/v1"
 )
 
 func getListers(ingress *networkingv1.Ingress, ingressClass *networkingv1.IngressClass) (networkinglisters.IngressLister, networkinglisters.IngressClassLister) {
@@ -95,6 +95,23 @@ func TestPublishWarningEvent(t *testing.T) {
 
 	PublishWarningEvent(fakeRecorder, ingress, err, reason, action)
 	Eventually(fakeRecorder.Events).Should(Receive())
+}
+
+func TestPublishWarningEventUsesCallerSuppliedReason(t *testing.T) {
+	RegisterTestingT(t)
+
+	fakeRecorder := events.NewFakeRecorder(10)
+	ingress := &networkingv1.Ingress{}
+	err := errors.New("TLSPolicyInvalidAnnotation: listener 443 ingress default/ing: oci-native-ingress.oraclecloud.com/listener-ssl-config.protocols: deprecated protocol \"TLSv1.1\" is not supported")
+	reason := "TLSPolicyInvalidAnnotation"
+
+	PublishWarningEvent(fakeRecorder, ingress, err, reason, "IngressReconcile")
+
+	Eventually(fakeRecorder.Events).Should(Receive(And(
+		ContainSubstring(reason),
+		ContainSubstring("listener 443"),
+		ContainSubstring(IngressListenerSslConfigAnnotation),
+	)))
 }
 
 func TestPublishIngressBackendValidationEvents(t *testing.T) {

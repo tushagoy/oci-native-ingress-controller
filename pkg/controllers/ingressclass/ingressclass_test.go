@@ -10,6 +10,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	"github.com/oracle/oci-go-sdk/v65/common"
+	"github.com/oracle/oci-go-sdk/v65/core"
 	ociloadbalancer "github.com/oracle/oci-go-sdk/v65/loadbalancer"
 	"github.com/oracle/oci-go-sdk/v65/waf"
 	"github.com/oracle/oci-native-ingress-controller/pkg/client"
@@ -219,6 +220,55 @@ func TestCheckForIngressClassParameterUpdates(t *testing.T) {
 	Expect(err).Should(BeNil())
 }
 
+func TestCheckForIngressClassParameterUpdatesSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	ingressClassList.Items[0].Annotations[util.IngressClassSecurityAttributesAnnotation] = `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`
+	lbClient := &MockLoadBalancerClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+	icp := v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			LoadBalancerName: "testecho1-998",
+			MinBandwidthMbps: 200,
+			MaxBandwidthMbps: 400,
+		},
+	}
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &icp)
+	Expect(err).Should(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.UpdateLoadBalancerRequests[0].SecurityAttributes).ShouldNot(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests[0].SecurityAttributes["Oracle-ZPR"]).Should(HaveKey("MaxEgressCount"))
+}
+
+func TestCheckForIngressClassParameterUpdatesMissingSecurityAttributesAnnotationSkipsEmptyReadback(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	delete(ingressClassList.Items[0].Annotations, util.IngressClassSecurityAttributesAnnotation)
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.DisplayName = common.String("k8s-default-ingress-class")
+	lbResponse.LoadBalancer.FreeformTags = map[string]string{}
+	lbResponse.LoadBalancer.SecurityAttributes = map[string]map[string]interface{}{}
+	lbClient := &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+	icp := v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			MinBandwidthMbps: 100,
+			MaxBandwidthMbps: 400,
+		},
+	}
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &icp)
+	Expect(err).Should(BeNil())
+	Expect(lbClient.UpdateLoadBalancerRequests).Should(BeEmpty())
+}
+
 func TestCheckForNetworkSecurityGroupsUpdate(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -234,6 +284,292 @@ func TestCheckForNetworkSecurityGroupsUpdate(t *testing.T) {
 
 	err := c.checkForNetworkSecurityGroupsUpdate(getContextWithClient(c, ctx), &ingressClassList.Items[0])
 	Expect(err).To(BeNil())
+}
+
+func TestCreateLoadBalancerWithSecurityAttributes(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                    fmt.Sprint(false),
+		util.IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`,
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-security-attributes", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{})
+	Expect(err).Should(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.CreateLoadBalancerRequests[0].SecurityAttributes).ShouldNot(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests[0].SecurityAttributes["Oracle-ZPR"]).Should(HaveKey("MaxEgressCount"))
+}
+
+func TestCreateLoadBalancer_WithReservedPrivateIPv4(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                   fmt.Sprint(false),
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.testreservedprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-private-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	privateIPClient := &MockPrivateIpClient{
+		PrivateIp: &ociclient.PrivateIp{
+			Id:        common.String("ocid1.privateip.oc1.iad.testreservedprivateip"),
+			IpAddress: common.String("10.0.0.10"),
+			Lifetime:  ociclient.PrivateIPLifetimeReserved,
+		},
+	}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, privateIPClient)
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate: true,
+		},
+	})
+	Expect(err).Should(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.IsPrivate).ShouldNot(BeNil())
+	Expect(*lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.IsPrivate).Should(BeTrue())
+	Expect(lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.ReservedIps).Should(HaveLen(1))
+	Expect(*lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.ReservedIps[0].Id).Should(Equal("ocid1.privateip.oc1.iad.testreservedprivateip"))
+}
+
+func TestCreateLoadBalancer_RejectsReservedPrivateIPForPublicLoadBalancer(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                   fmt.Sprint(false),
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.testreservedprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-both-ips", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	privateIPClient := &MockPrivateIpClient{
+		PrivateIp: &ociclient.PrivateIp{
+			Id:        common.String("ocid1.privateip.oc1.iad.testreservedprivateip"),
+			IpAddress: common.String("10.0.0.10"),
+			Lifetime:  ociclient.PrivateIPLifetimeReserved,
+		},
+	}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, privateIPClient)
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate: false,
+		},
+	})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("reserved private IP is only supported for private load balancers"))
+	Expect(lbClient.CreateLoadBalancerRequests).Should(BeEmpty())
+	Expect(privateIPClient.RequestedIds).Should(BeEmpty())
+}
+
+func TestCreateLoadBalancer_WithReservedPublicAndPrivateIPsOnPrivateLoadBalancer(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                   fmt.Sprint(false),
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.testreservedprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-both-ips", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	privateIPClient := &MockPrivateIpClient{
+		PrivateIp: &ociclient.PrivateIp{
+			Id:        common.String("ocid1.privateip.oc1.iad.testreservedprivateip"),
+			IpAddress: common.String("10.0.0.10"),
+			Lifetime:  ociclient.PrivateIPLifetimeReserved,
+		},
+	}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, privateIPClient)
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate:               true,
+			ReservedPublicAddressId: "ocid1.publicip.oc1.iad.testreservedpublicip",
+		},
+	})
+	Expect(err).Should(BeNil())
+	Expect(lbClient.CreateLoadBalancerRequests).Should(HaveLen(1))
+	Expect(lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.IsPrivate).ShouldNot(BeNil())
+	Expect(*lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.IsPrivate).Should(BeTrue())
+	Expect(lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.ReservedIps).Should(HaveLen(2))
+	Expect(*lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.ReservedIps[0].Id).Should(Equal("ocid1.publicip.oc1.iad.testreservedpublicip"))
+	Expect(*lbClient.CreateLoadBalancerRequests[0].CreateLoadBalancerDetails.ReservedIps[1].Id).Should(Equal("ocid1.privateip.oc1.iad.testreservedprivateip"))
+}
+
+func TestCreateLoadBalancer_RejectsReservedPrivateIPv6(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                   fmt.Sprint(false),
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.ipv6.oc1.iad.testreservedipv6",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-ipv6", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	privateIPClient := &MockPrivateIpClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, privateIPClient)
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate: true,
+		},
+	})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("reserved private IPv6 is not supported"))
+	Expect(lbClient.CreateLoadBalancerRequests).Should(BeEmpty())
+	Expect(privateIPClient.RequestedIds).Should(BeEmpty())
+}
+
+func TestCreateLoadBalancer_RejectsEmptyReservedPrivateIPAnnotation(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassIsDefault:                   fmt.Sprint(false),
+		util.IngressClassReservedPrivateIpAnnotation: "   ",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-empty-private-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbClient := &MockLoadBalancerClient{}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+
+	_, err := c.createLoadBalancer(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("must not be empty"))
+	Expect(lbClient.CreateLoadBalancerRequests).Should(BeEmpty())
+}
+
+func TestCheckForIngressClassParameterUpdates_RejectsReservedPrivateIPMutation(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassLoadBalancerIdAnnotation:    "id",
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.updatedprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-updated-private-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.IpAddresses = []ociloadbalancer.IpAddress{{
+		IpAddress:  common.String("10.0.0.10"),
+		IsPublic:   common.Bool(false),
+		ReservedIp: &ociloadbalancer.ReservedIp{Id: common.String("ocid1.privateip.oc1.iad.existingprivateip")},
+	}}
+	lbClient := &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}
+	privateIPClient := &MockPrivateIpClient{
+		PrivateIp: &ociclient.PrivateIp{
+			Id:        common.String("ocid1.privateip.oc1.iad.updatedprivateip"),
+			IpAddress: common.String("10.0.0.11"),
+			Lifetime:  ociclient.PrivateIPLifetimeReserved,
+		},
+	}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, privateIPClient)
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate: true,
+		},
+	})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("reserved private IP setting is immutable"))
+	Expect(privateIPClient.RequestedIds).Should(BeEmpty())
+}
+
+func TestCheckForIngressClassParameterUpdates_RejectsReservedPrivateIPForPublicLoadBalancer(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassLoadBalancerIdAnnotation:    "id",
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.existingprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-public-lb-private-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.IpAddresses = []ociloadbalancer.IpAddress{{
+		IpAddress:  common.String("10.0.0.10"),
+		IsPublic:   common.Bool(false),
+		ReservedIp: &ociloadbalancer.ReservedIp{Id: common.String("ocid1.privateip.oc1.iad.existingprivateip")},
+	}}
+	privateIPClient := &MockPrivateIpClient{Err: fmt.Errorf("unexpected private IP lookup")}
+	c := initsWithCustomClients(ctx, ingressClassList, &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}, privateIPClient)
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate: false,
+		},
+	})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("reserved private IP is only supported for private load balancers"))
+	Expect(privateIPClient.RequestedIds).Should(BeEmpty())
+}
+
+func TestCheckForIngressClassParameterUpdates_RejectsReservedPublicIPMutation(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassLoadBalancerIdAnnotation: "id",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-updated-public-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.IpAddresses = []ociloadbalancer.IpAddress{{
+		IpAddress:  common.String("129.146.1.10"),
+		IsPublic:   common.Bool(true),
+		ReservedIp: &ociloadbalancer.ReservedIp{Id: common.String("ocid1.publicip.oc1.iad.existingpublicip")},
+	}}
+	lbClient := &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}
+	c := initsWithCustomClients(ctx, ingressClassList, lbClient, &MockPrivateIpClient{})
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			ReservedPublicAddressId: "ocid1.publicip.oc1.iad.updatedpublicip",
+		},
+	})
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("reserved public IP setting is immutable"))
+}
+
+func TestCheckForIngressClassParameterUpdates_DoesNotLookupReservedPrivateIPWhenUnchanged(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	annotations := map[string]string{
+		util.IngressClassLoadBalancerIdAnnotation:    "id",
+		util.IngressClassReservedPrivateIpAnnotation: "ocid1.privateip.oc1.iad.existingprivateip",
+	}
+	ingressClassList := util.GetIngressClassResourceWithAnnotation("ingressclass-with-existing-private-ip", annotations, "oci.oraclecloud.com/native-ingress-controller")
+	lbResponse := util.SampleLoadBalancerResponse()
+	lbResponse.LoadBalancer.IpAddresses = []ociloadbalancer.IpAddress{{
+		IpAddress:  common.String("10.0.0.10"),
+		IsPublic:   common.Bool(false),
+		ReservedIp: &ociloadbalancer.ReservedIp{Id: common.String("ocid1.privateip.oc1.iad.existingprivateip")},
+	}}
+	privateIPClient := &MockPrivateIpClient{Err: fmt.Errorf("unexpected private IP lookup")}
+	c := initsWithCustomClients(ctx, ingressClassList, &MockLoadBalancerClient{GetLoadBalancerResponse: &lbResponse}, privateIPClient)
+
+	err := c.checkForIngressClassParameterUpdates(getContextWithClient(c, ctx), &ingressClassList.Items[0], &v1beta1.IngressClassParameters{
+		Spec: v1beta1.IngressClassParametersSpec{
+			IsPrivate:        true,
+			LoadBalancerName: "testecho1-999",
+			MinBandwidthMbps: 100,
+			MaxBandwidthMbps: 400,
+		},
+	})
+	Expect(err).Should(BeNil())
+	Expect(privateIPClient.RequestedIds).Should(BeEmpty())
 }
 
 func TestDeleteFinalizer(t *testing.T) {
@@ -269,8 +605,10 @@ func getContextWithClient(c *Controller, ctx context.Context) context.Context {
 }
 
 func inits(ctx context.Context, ingressClassList *networkingv1.IngressClassList) *Controller {
+	return initsWithCustomClients(ctx, ingressClassList, &MockLoadBalancerClient{}, &MockPrivateIpClient{})
+}
 
-	lbClient := getLoadBalancerClient()
+func initsWithCustomClients(ctx context.Context, ingressClassList *networkingv1.IngressClassList, lbClient ociclient.LoadBalancerInterface, privateIPClient ociclient.PrivateIpInterface) *Controller {
 	wafClient := getWafClient()
 
 	loadBalancerClient := &lb.LoadBalancerClient{
@@ -286,7 +624,7 @@ func inits(ctx context.Context, ingressClassList *networkingv1.IngressClassList)
 	}
 
 	ingressClassInformer, saInformer, k8client := setUp(ctx, ingressClassList)
-	wrapperClient := client.NewWrapperClient(k8client, firewallClient, loadBalancerClient, nil, nil)
+	wrapperClient := client.NewWrapperClient(k8client, firewallClient, loadBalancerClient, privateIPClient, nil, nil)
 	mockClient := &client.ClientProvider{
 		K8sClient:           k8client,
 		DefaultConfigGetter: &MockConfigGetter{},
@@ -313,10 +651,6 @@ func setUp(ctx context.Context, ingressClassList *networkingv1.IngressClassList)
 	cache.WaitForCacheSync(ctx.Done(), ingressClassInformer.Informer().HasSynced)
 
 	return ingressClassInformer, saInformer, fakeClient
-}
-
-func getLoadBalancerClient() ociclient.LoadBalancerInterface {
-	return &MockLoadBalancerClient{}
 }
 
 func getWafClient() ociclient.WafInterface {
@@ -346,14 +680,20 @@ func (m MockWafClient) DeleteWebAppFirewall(ctx context.Context, request waf.Del
 }
 
 type MockLoadBalancerClient struct {
+	CreateLoadBalancerRequests []ociloadbalancer.CreateLoadBalancerRequest
+	UpdateLoadBalancerRequests []ociloadbalancer.UpdateLoadBalancerRequest
+	GetLoadBalancerResponse    *ociloadbalancer.GetLoadBalancerResponse
 }
 
-func (m MockLoadBalancerClient) GetLoadBalancer(ctx context.Context, request ociloadbalancer.GetLoadBalancerRequest) (ociloadbalancer.GetLoadBalancerResponse, error) {
+func (m *MockLoadBalancerClient) GetLoadBalancer(ctx context.Context, request ociloadbalancer.GetLoadBalancerRequest) (ociloadbalancer.GetLoadBalancerResponse, error) {
 	if *request.LoadBalancerId == "networkerror" {
 		return ociloadbalancer.GetLoadBalancerResponse{}, NetworkError{}
 	}
 	if *request.LoadBalancerId == "notfound" {
 		return ociloadbalancer.GetLoadBalancerResponse{}, &exception.NotFoundServiceError{}
+	}
+	if m.GetLoadBalancerResponse != nil {
+		return *m.GetLoadBalancerResponse, nil
 	}
 
 	res := util.SampleLoadBalancerResponse()
@@ -367,7 +707,8 @@ func (n NetworkError) Error() string {
 	return "Failure due to network error"
 }
 
-func (m MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerRequest) (response ociloadbalancer.UpdateLoadBalancerResponse, err error) {
+func (m *MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerRequest) (response ociloadbalancer.UpdateLoadBalancerResponse, err error) {
+	m.UpdateLoadBalancerRequests = append(m.UpdateLoadBalancerRequests, request)
 	return ociloadbalancer.UpdateLoadBalancerResponse{
 		RawResponse:      nil,
 		OpcWorkRequestId: common.String("id"),
@@ -375,7 +716,7 @@ func (m MockLoadBalancerClient) UpdateLoadBalancer(ctx context.Context, request 
 	}, nil
 }
 
-func (m MockLoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerShapeRequest) (response ociloadbalancer.UpdateLoadBalancerShapeResponse, err error) {
+func (m *MockLoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, request ociloadbalancer.UpdateLoadBalancerShapeRequest) (response ociloadbalancer.UpdateLoadBalancerShapeResponse, err error) {
 	return ociloadbalancer.UpdateLoadBalancerShapeResponse{
 		RawResponse:      nil,
 		OpcWorkRequestId: common.String("id"),
@@ -383,7 +724,7 @@ func (m MockLoadBalancerClient) UpdateLoadBalancerShape(ctx context.Context, req
 	}, nil
 }
 
-func (m MockLoadBalancerClient) UpdateNetworkSecurityGroups(ctx context.Context,
+func (m *MockLoadBalancerClient) UpdateNetworkSecurityGroups(ctx context.Context,
 	request ociloadbalancer.UpdateNetworkSecurityGroupsRequest) (ociloadbalancer.UpdateNetworkSecurityGroupsResponse, error) {
 	return ociloadbalancer.UpdateNetworkSecurityGroupsResponse{
 		RawResponse:      nil,
@@ -392,7 +733,8 @@ func (m MockLoadBalancerClient) UpdateNetworkSecurityGroups(ctx context.Context,
 	}, nil
 }
 
-func (m MockLoadBalancerClient) CreateLoadBalancer(ctx context.Context, request ociloadbalancer.CreateLoadBalancerRequest) (ociloadbalancer.CreateLoadBalancerResponse, error) {
+func (m *MockLoadBalancerClient) CreateLoadBalancer(ctx context.Context, request ociloadbalancer.CreateLoadBalancerRequest) (ociloadbalancer.CreateLoadBalancerResponse, error) {
+	m.CreateLoadBalancerRequests = append(m.CreateLoadBalancerRequests, request)
 	id := "id"
 	return ociloadbalancer.CreateLoadBalancerResponse{
 		RawResponse:      nil,
@@ -401,14 +743,14 @@ func (m MockLoadBalancerClient) CreateLoadBalancer(ctx context.Context, request 
 	}, nil
 }
 
-func (m MockLoadBalancerClient) DeleteLoadBalancer(ctx context.Context, request ociloadbalancer.DeleteLoadBalancerRequest) (ociloadbalancer.DeleteLoadBalancerResponse, error) {
+func (m *MockLoadBalancerClient) DeleteLoadBalancer(ctx context.Context, request ociloadbalancer.DeleteLoadBalancerRequest) (ociloadbalancer.DeleteLoadBalancerResponse, error) {
 	return ociloadbalancer.DeleteLoadBalancerResponse{
 		OpcRequestId:     common.String("OpcRequestId"),
 		OpcWorkRequestId: common.String("OpcWorkRequestId"),
 	}, nil
 }
 
-func (m MockLoadBalancerClient) GetWorkRequest(ctx context.Context, request ociloadbalancer.GetWorkRequestRequest) (ociloadbalancer.GetWorkRequestResponse, error) {
+func (m *MockLoadBalancerClient) GetWorkRequest(ctx context.Context, request ociloadbalancer.GetWorkRequestRequest) (ociloadbalancer.GetWorkRequestResponse, error) {
 	id := "id"
 	requestId := "opcrequestid"
 	return ociloadbalancer.GetWorkRequestResponse{
@@ -423,11 +765,11 @@ func (m MockLoadBalancerClient) GetWorkRequest(ctx context.Context, request ocil
 	}, nil
 }
 
-func (m MockLoadBalancerClient) CreateBackendSet(ctx context.Context, request ociloadbalancer.CreateBackendSetRequest) (ociloadbalancer.CreateBackendSetResponse, error) {
+func (m *MockLoadBalancerClient) CreateBackendSet(ctx context.Context, request ociloadbalancer.CreateBackendSetRequest) (ociloadbalancer.CreateBackendSetResponse, error) {
 	return ociloadbalancer.CreateBackendSetResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) UpdateBackendSet(ctx context.Context, request ociloadbalancer.UpdateBackendSetRequest) (ociloadbalancer.UpdateBackendSetResponse, error) {
+func (m *MockLoadBalancerClient) UpdateBackendSet(ctx context.Context, request ociloadbalancer.UpdateBackendSetRequest) (ociloadbalancer.UpdateBackendSetResponse, error) {
 	reqId := "opcrequestid"
 	res := ociloadbalancer.UpdateBackendSetResponse{
 		RawResponse:      nil,
@@ -437,11 +779,11 @@ func (m MockLoadBalancerClient) UpdateBackendSet(ctx context.Context, request oc
 	return res, nil
 }
 
-func (m MockLoadBalancerClient) DeleteBackendSet(ctx context.Context, request ociloadbalancer.DeleteBackendSetRequest) (ociloadbalancer.DeleteBackendSetResponse, error) {
+func (m *MockLoadBalancerClient) DeleteBackendSet(ctx context.Context, request ociloadbalancer.DeleteBackendSetRequest) (ociloadbalancer.DeleteBackendSetResponse, error) {
 	return ociloadbalancer.DeleteBackendSetResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) GetBackendSetHealth(ctx context.Context, request ociloadbalancer.GetBackendSetHealthRequest) (ociloadbalancer.GetBackendSetHealthResponse, error) {
+func (m *MockLoadBalancerClient) GetBackendSetHealth(ctx context.Context, request ociloadbalancer.GetBackendSetHealthRequest) (ociloadbalancer.GetBackendSetHealthResponse, error) {
 	backendCount := 1
 	return ociloadbalancer.GetBackendSetHealthResponse{
 		RawResponse: nil,
@@ -457,28 +799,52 @@ func (m MockLoadBalancerClient) GetBackendSetHealth(ctx context.Context, request
 	}, nil
 }
 
-func (m MockLoadBalancerClient) CreateRoutingPolicy(ctx context.Context, request ociloadbalancer.CreateRoutingPolicyRequest) (ociloadbalancer.CreateRoutingPolicyResponse, error) {
+func (m *MockLoadBalancerClient) CreateRoutingPolicy(ctx context.Context, request ociloadbalancer.CreateRoutingPolicyRequest) (ociloadbalancer.CreateRoutingPolicyResponse, error) {
 	return ociloadbalancer.CreateRoutingPolicyResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) UpdateRoutingPolicy(ctx context.Context, request ociloadbalancer.UpdateRoutingPolicyRequest) (ociloadbalancer.UpdateRoutingPolicyResponse, error) {
+func (m *MockLoadBalancerClient) UpdateRoutingPolicy(ctx context.Context, request ociloadbalancer.UpdateRoutingPolicyRequest) (ociloadbalancer.UpdateRoutingPolicyResponse, error) {
 	return ociloadbalancer.UpdateRoutingPolicyResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) DeleteRoutingPolicy(ctx context.Context, request ociloadbalancer.DeleteRoutingPolicyRequest) (ociloadbalancer.DeleteRoutingPolicyResponse, error) {
+func (m *MockLoadBalancerClient) DeleteRoutingPolicy(ctx context.Context, request ociloadbalancer.DeleteRoutingPolicyRequest) (ociloadbalancer.DeleteRoutingPolicyResponse, error) {
 	return ociloadbalancer.DeleteRoutingPolicyResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) CreateListener(ctx context.Context, request ociloadbalancer.CreateListenerRequest) (ociloadbalancer.CreateListenerResponse, error) {
+func (m *MockLoadBalancerClient) CreateListener(ctx context.Context, request ociloadbalancer.CreateListenerRequest) (ociloadbalancer.CreateListenerResponse, error) {
 	return ociloadbalancer.CreateListenerResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) UpdateListener(ctx context.Context, request ociloadbalancer.UpdateListenerRequest) (ociloadbalancer.UpdateListenerResponse, error) {
+func (m *MockLoadBalancerClient) UpdateListener(ctx context.Context, request ociloadbalancer.UpdateListenerRequest) (ociloadbalancer.UpdateListenerResponse, error) {
 	return ociloadbalancer.UpdateListenerResponse{}, nil
 }
 
-func (m MockLoadBalancerClient) DeleteListener(ctx context.Context, request ociloadbalancer.DeleteListenerRequest) (ociloadbalancer.DeleteListenerResponse, error) {
+func (m *MockLoadBalancerClient) DeleteListener(ctx context.Context, request ociloadbalancer.DeleteListenerRequest) (ociloadbalancer.DeleteListenerResponse, error) {
 	return ociloadbalancer.DeleteListenerResponse{}, nil
+}
+
+type MockPrivateIpClient struct {
+	PrivateIp    *ociclient.PrivateIp
+	Err          error
+	RequestedIds []string
+}
+
+func (m *MockPrivateIpClient) GetPrivateIp(ctx context.Context, request ociclient.GetPrivateIpRequest) (ociclient.GetPrivateIpResponse, error) {
+	privateIpID := ""
+	if request.PrivateIpId != nil {
+		privateIpID = *request.PrivateIpId
+	}
+	m.RequestedIds = append(m.RequestedIds, privateIpID)
+	if m.Err != nil {
+		return ociclient.GetPrivateIpResponse{}, m.Err
+	}
+	if m.PrivateIp == nil {
+		return ociclient.GetPrivateIpResponse{}, fmt.Errorf("private IP %s not found", privateIpID)
+	}
+
+	return ociclient.GetPrivateIpResponse{
+		PrivateIp: core.PrivateIp(*m.PrivateIp),
+	}, nil
 }
 
 // MockConfigGetter is a mock implementation of the ConfigGetter interface for testing purposes.

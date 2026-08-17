@@ -11,9 +11,10 @@ package routingpolicy
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/pkg/errors"
 	"k8s.io/klog/v2"
-	"strings"
 
 	"github.com/oracle/oci-native-ingress-controller/pkg/util"
 	networkingv1 "k8s.io/api/networking/v1"

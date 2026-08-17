@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -183,6 +184,56 @@ func TestGetIngressClassNetworkSecurityGroupIds(t *testing.T) {
 		Should(Equal([]string{"id1", "id2", "id3", "id4"}))
 }
 
+func TestGetIngressClassReservedPrivateIpAddressId(t *testing.T) {
+	RegisterTestingT(t)
+
+	ingressClassWithNoAnnotation := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+	}
+	ingressClassWithReservedPrivateIP := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressClassReservedPrivateIpAnnotation: "  ocid1.privateip.oc1.iad.example  "},
+		},
+	}
+	ingressClassWithEmptyReservedPrivateIP := &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressClassReservedPrivateIpAnnotation: "   "},
+		},
+	}
+
+	value, err := GetIngressClassReservedPrivateIpAddressId(ingressClassWithNoAnnotation)
+	Expect(err).Should(BeNil())
+	Expect(value).Should(BeEmpty())
+
+	value, err = GetIngressClassReservedPrivateIpAddressId(ingressClassWithReservedPrivateIP)
+	Expect(err).Should(BeNil())
+	Expect(value).Should(Equal("ocid1.privateip.oc1.iad.example"))
+
+	_, err = GetIngressClassReservedPrivateIpAddressId(ingressClassWithEmptyReservedPrivateIP)
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("must not be empty"))
+}
+
+func TestGetOcidResourceType(t *testing.T) {
+	RegisterTestingT(t)
+
+	resourceType, err := GetOcidResourceType(" ocid1.privateip.oc1.iad.example ")
+	Expect(err).Should(BeNil())
+	Expect(resourceType).Should(Equal("privateip"))
+
+	resourceType, err = GetOcidResourceType("ocid1.ipv6.oc1.iad.example")
+	Expect(err).Should(BeNil())
+	Expect(resourceType).Should(Equal("ipv6"))
+
+	_, err = GetOcidResourceType("  ")
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("must not be empty"))
+
+	_, err = GetOcidResourceType("invalid")
+	Expect(err).ShouldNot(BeNil())
+	Expect(err.Error()).Should(ContainSubstring("invalid OCID format"))
+}
+
 func TestGetIngressClassDeleteProtectionEnabled(t *testing.T) {
 	RegisterTestingT(t)
 
@@ -304,22 +355,68 @@ func TestGetIngressClassLoadBalancerId(t *testing.T) {
 	Expect(result).Should(Equal(""))
 }
 
-func TestGetListenerTlsCertificateOcid(t *testing.T) {
+func TestGetListenerTlsCertificateOcids(t *testing.T) {
 	RegisterTestingT(t)
-	certOcid := "certOcid"
 	i := networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
-			Annotations: map[string]string{IngressListenerTlsCertificateAnnotation: certOcid},
+			Annotations: map[string]string{
+				IngressListenerTlsCertificateAnnotation: " certA , certB,certA,, certC , ",
+			},
 		},
 	}
 
-	result := GetListenerTlsCertificateOcid(&i)
-	Expect(*result).Should(Equal(certOcid))
+	result := GetListenerTlsCertificateOcids(&i)
+	Expect(result).Should(Equal([]string{"certA", "certB", "certC"}))
+
+	i.Annotations = map[string]string{
+		IngressListenerTlsCertificateAnnotation: "   ,  ",
+	}
+	result = GetListenerTlsCertificateOcids(&i)
+	Expect(len(result)).Should(Equal(0))
 
 	i.Annotations = nil
+	result = GetListenerTlsCertificateOcids(&i)
+	Expect(result).Should(BeNil())
+}
 
-	result = GetListenerTlsCertificateOcid(&i)
-	Expect(result).To(BeNil())
+func TestIsIngressProtocolHTTPBased(t *testing.T) {
+	RegisterTestingT(t)
+	i := networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{IngressProtocolAnnotation: ProtocolHTTP},
+		},
+	}
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
+	i.Annotations[IngressProtocolAnnotation] = ProtocolHTTP2
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
+	i.Annotations[IngressProtocolAnnotation] = ProtocolGRPC
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+
+	i.Annotations[IngressProtocolAnnotation] = ProtocolTCP
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeFalse())
+
+	i.Annotations = nil
+	Expect(IsIngressProtocolHTTPBased(&i)).Should(BeTrue())
+}
+
+func TestIsListenerProtocolTLSRequired(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(IsListenerProtocolTLSRequired(ProtocolHTTP)).Should(BeFalse())
+	Expect(IsListenerProtocolTLSRequired(ProtocolTCP)).Should(BeFalse())
+	Expect(IsListenerProtocolTLSRequired(ProtocolHTTP2)).Should(BeTrue())
+	Expect(IsListenerProtocolTLSRequired(ProtocolGRPC)).Should(BeTrue())
+}
+
+func TestIsListenerProtocolUsingHTTP2CipherSuite(t *testing.T) {
+	RegisterTestingT(t)
+
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolHTTP)).Should(BeFalse())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolTCP)).Should(BeFalse())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolHTTP2)).Should(BeTrue())
+	Expect(IsListenerProtocolUsingHTTP2CipherSuite(ProtocolGRPC)).Should(BeTrue())
 }
 
 func TestGetBackendTlsEnabled(t *testing.T) {
@@ -848,7 +945,7 @@ func TestDetermineListenerPort(t *testing.T) {
 	Expect(listenerPort).Should(Equal(httpsPort))
 
 	delete(annotations, IngressHttpsListenerPortAnnotation)
-	annotations[IngressListenerTlsCertificateAnnotation] = "oci_cert"
+	annotations[IngressListenerTlsCertificateAnnotation] = "oci_cert_1, oci_cert_2,oci_cert_1"
 	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(listenerPort).Should(Equal(servicePort))
@@ -857,6 +954,12 @@ func TestDetermineListenerPort(t *testing.T) {
 	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(listenerPort).Should(Equal(httpsPort))
+
+	annotations[IngressListenerTlsCertificateAnnotation] = " , "
+	delete(annotations, IngressHttpsListenerPortAnnotation)
+	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "not-tls-configured", servicePort)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(listenerPort).Should(Equal(httpPort))
 }
 
 func TestIsBackendServiceEqual(t *testing.T) {
@@ -1100,4 +1203,74 @@ func TestHasServiceBackend(t *testing.T) {
 	Expect(HasServiceBackend(networkingv1.HTTPIngressPath{})).Should(BeFalse())
 	Expect(HasServiceBackend(resourceBackend)).Should(BeFalse())
 	Expect(HasServiceBackend(serviceBackend)).Should(BeTrue())
+}
+
+func TestGetSecurityAttributes(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    map[string]map[string]interface{}
+		wantErr     bool
+	}{
+		{
+			name:        "missing annotation",
+			annotations: map[string]string{},
+		},
+		{
+			name: "empty annotation",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: "",
+			},
+		},
+		{
+			name: "valid nested attributes",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":{"MaxEgressCount":{"value":"42","mode":"enforce"}}}`,
+			},
+			expected: map[string]map[string]interface{}{
+				"Oracle-ZPR": {
+					"MaxEgressCount": map[string]interface{}{
+						"value": "42",
+						"mode":  "enforce",
+					},
+				},
+			},
+		},
+		{
+			name: "valid scalar attribute",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"ZPR":{"MaxEgressCount":"zpr"}}`,
+			},
+			expected: map[string]map[string]interface{}{
+				"ZPR": {"MaxEgressCount": "zpr"},
+			},
+		},
+		{
+			name: "invalid outer value",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: "not a map",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid inner value",
+			annotations: map[string]string{
+				IngressClassSecurityAttributesAnnotation: `{"Oracle-ZPR":["foo"]}`,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ingressClass := &networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
+			actual, err := GetSecurityAttributes(ingressClass)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("GetSecurityAttributes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !reflect.DeepEqual(actual, tt.expected) {
+				t.Errorf("GetSecurityAttributes() = %#v, expected %#v", actual, tt.expected)
+			}
+		})
+	}
 }
