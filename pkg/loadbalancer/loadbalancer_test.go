@@ -251,6 +251,40 @@ func TestLoadBalancerClient_UpdateBackends(t *testing.T) {
 
 }
 
+func TestLoadBalancerClient_UpdateBackendsWhenDrainStateChanges(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+
+	backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
+	backends := []ociloadbalancer.BackendDetails{
+		util.NewBackend("127.89.90.90", 80, true),
+	}
+
+	err := loadBalancerClient.UpdateBackends(context.TODO(), "id", backendSetName, backends)
+
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
+	Expect(capturedUpdateBackendSetRequest.Backends).To(HaveLen(1))
+	Expect(*capturedUpdateBackendSetRequest.Backends[0].Drain).To(BeTrue())
+}
+
+func TestLoadBalancerClient_UpdateBackendsSkipsMatchingDrainState(t *testing.T) {
+	RegisterTestingT(t)
+	loadBalancerClient := setupLBClient()
+	capturedUpdateBackendSetRequest = nil
+
+	backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
+	backends := []ociloadbalancer.BackendDetails{
+		util.NewBackend("127.89.90.90", 80, false),
+	}
+
+	err := loadBalancerClient.UpdateBackends(context.TODO(), "id", backendSetName, backends)
+
+	Expect(err).To(BeNil())
+	Expect(capturedUpdateBackendSetRequest).To(BeNil())
+}
+
 func TestLoadBalancerClient_UpdateBackends_PreservesBackendSetTLSPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	loadBalancerClient := setupLBClient()

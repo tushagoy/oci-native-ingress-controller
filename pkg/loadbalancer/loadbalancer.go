@@ -584,12 +584,12 @@ func (lbc *LoadBalancerClient) UpdateBackends(ctx context.Context, lbID string, 
 
 	actual := sets.NewString()
 	for _, backend := range backendSet.Backends {
-		actual.Insert(fmt.Sprintf("%s:%d", *backend.IpAddress, *backend.Port))
+		actual.Insert(backendState(*backend.IpAddress, *backend.Port, backend.Drain))
 	}
 
 	desired := sets.NewString()
 	for _, backend := range backends {
-		desired.Insert(fmt.Sprintf("%s:%d", *backend.IpAddress, *backend.Port))
+		desired.Insert(backendState(*backend.IpAddress, *backend.Port, backend.Drain))
 	}
 
 	if desired.Equal(actual) {
@@ -618,6 +618,14 @@ func (lbc *LoadBalancerClient) UpdateBackends(ctx context.Context, lbID string, 
 
 	return lbc.UpdateBackendSet(ctx, lbID, etag, *backendSet.Name, policy, healthCheckerDetails, sslConfig, backends,
 		backendSet.SessionPersistenceConfiguration, backendSet.LbCookieSessionPersistenceConfiguration)
+}
+
+func backendState(ipAddress string, port int, drain *bool) string {
+	isDraining := false
+	if drain != nil {
+		isDraining = *drain
+	}
+	return fmt.Sprintf("%s:%d:%t", ipAddress, port, isDraining)
 }
 
 // UpdateBackendSetDetails updates sslConfig, policy, healthChecker, and session persistence configs while preserving existing backends

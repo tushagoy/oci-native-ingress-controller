@@ -169,6 +169,49 @@ func TestNoDefaultBackends(t *testing.T) {
 	Expect(len(backends)).Should(Equal(0))
 }
 
+func TestGetBackendDetailsDrainsTerminatingPods(t *testing.T) {
+	RegisterTestingT(t)
+
+	deletionTimestamp := metav1.Now()
+	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		cache.NamespaceIndex: cache.MetaNamespaceIndexFunc,
+	})
+	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      "ready-pod",
+		Namespace: namespace,
+	}})).To(Succeed())
+	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:              "terminating-pod",
+		Namespace:         namespace,
+		DeletionTimestamp: &deletionTimestamp,
+	}})).To(Succeed())
+
+	c := &Controller{podLister: corelisters.NewPodLister(podIndexer)}
+	endpointAddresses := []corev1.EndpointAddress{
+		{
+			IP: "10.0.0.1",
+			TargetRef: &corev1.ObjectReference{
+				Kind: "Pod",
+				Name: "ready-pod",
+			},
+		},
+		{
+			IP: "10.0.0.2",
+			TargetRef: &corev1.ObjectReference{
+				Kind: "Pod",
+				Name: "terminating-pod",
+			},
+		},
+	}
+
+	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080)
+
+	Expect(err).NotTo(HaveOccurred())
+	Expect(backends).To(HaveLen(2))
+	Expect(*backends[0].Drain).To(BeFalse())
+	Expect(*backends[1].Drain).To(BeTrue())
+}
+
 func TestDefaultBackends(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())

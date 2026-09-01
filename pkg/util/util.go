@@ -980,12 +980,12 @@ func GetIngressesForClass(lister networkinglisters.IngressLister, ingressClass *
 	return result, nil
 }
 
-func NewBackend(ip string, port int32) ociloadbalancer.BackendDetails {
+func NewBackend(ip string, port int32, drain bool) ociloadbalancer.BackendDetails {
 	return ociloadbalancer.BackendDetails{
 		IpAddress: common.String(ip),
 		Port:      common.Int(int(port)),
 		Weight:    common.Int(1),
-		Drain:     common.Bool(false),
+		Drain:     common.Bool(drain),
 		Backup:    common.Bool(false),
 		Offline:   common.Bool(false),
 	}

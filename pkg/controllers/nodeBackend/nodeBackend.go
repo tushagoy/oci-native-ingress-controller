@@ -236,7 +236,7 @@ func (c *Controller) ensureBackendsForIngress(ingress *networkingv1.Ingress, ing
 			trafficPolicy := svc.Spec.ExternalTrafficPolicy
 			if trafficPolicy == corev1.ServiceExternalTrafficPolicyTypeCluster {
 				for _, node := range nodes {
-					backends = append(backends, util.NewBackend(NodeInternalIP(node), nodePort))
+					backends = append(backends, util.NewBackend(NodeInternalIP(node), nodePort, false))
 				}
 			} else {
 				backends, err = getBackendsFromPods(c.endpointLister, c.podLister, c.nodeLister, ingress.Namespace, svcName, backends, nodePort)
@@ -269,7 +269,7 @@ func getBackendsFromPods(endpointLister corelisters.EndpointsLister, podLister c
 			}
 			return nil, err
 		}
-		backends = append(backends, util.NewBackend(NodeInternalIP(node), nodePort))
+		backends = append(backends, util.NewBackend(NodeInternalIP(node), nodePort, false))
 	}
 	return backends, nil
 }

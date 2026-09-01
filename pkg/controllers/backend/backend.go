@@ -216,9 +216,9 @@ func (c *Controller) ensureBackendsForIngress(ctx context.Context, ingress *netw
 				return fmt.Errorf("unable to fetch endpoints for %s/%s/%d: %w", ingress.Namespace, svcName, targetPort, err)
 			}
 
-			backends := []ociloadbalancer.BackendDetails{}
-			for _, epAddr := range epAddrs {
-				backends = append(backends, util.NewBackend(epAddr.IP, targetPort))
+			backends, err := c.getBackendDetails(ingress.Namespace, epAddrs, targetPort)
+			if err != nil {
+				return err
 			}
 
 			backendSetName := util.GenerateBackendSetName(ingress.Namespace, svcName, svcPort)
@@ -317,10 +317,24 @@ func (c *Controller) getDefaultBackends(ingresses []*networkingv1.Ingress) ([]oc
 		return nil, fmt.Errorf("unable to fetch endpoints for %s/%s/%d: %w", namespace, svcName, targetPort, err)
 	}
 
-	for _, epAddr := range epAdrress {
-		backends = append(backends, util.NewBackend(epAddr.IP, targetPort))
+	backends, err = c.getBackendDetails(namespace, epAdrress, targetPort)
+	if err != nil {
+		return nil, err
 	}
 	return backends, err
+}
+
+func (c *Controller) getBackendDetails(namespace string, endpointAddresses []corev1.EndpointAddress, targetPort int32) ([]ociloadbalancer.BackendDetails, error) {
+	backends := make([]ociloadbalancer.BackendDetails, 0, len(endpointAddresses))
+	for _, endpointAddress := range endpointAddresses {
+		pod, err := c.podLister.Pods(namespace).Get(endpointAddress.TargetRef.Name)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch pod %s/%s: %w", namespace, endpointAddress.TargetRef.Name, err)
+		}
+
+		backends = append(backends, util.NewBackend(endpointAddress.IP, targetPort, pod.DeletionTimestamp != nil))
+	}
+	return backends, nil
 }
 
 func hasReadinessGate(pod *corev1.Pod, readinessGate corev1.PodConditionType) bool {

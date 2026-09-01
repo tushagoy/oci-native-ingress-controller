@@ -29,6 +29,7 @@ The native ingress controller itself is lightweight process and pushes all the r
     + [Pod Readiness Gate](#pod-readiness-gate)
       - [Configuration](#configuration)
       - [Checking the pod readiness condition](#checking-the-pod-readiness-condition)
+    + [Graceful Backend Draining](#graceful-backend-draining)
     + [HTTPS/TLS Support](#httpstls-support)
       - [Sample configuration : Using Secret](#sample-configuration--using-secret)
       - [Sample configuration : Using Certificate](#sample-configuration--using-certificate)
@@ -460,6 +461,20 @@ NAME                                             READY   STATUS    RESTARTS   AG
 testecho-7cdcfff87f-b6xt4                        1/1     Running   0          35s   10.0.10.242   10.0.10.135   <none>           0/1
 testecho-7cdcfff87f-b6xt4                        1/1     Running   0          72s   10.0.10.242   10.0.10.135   <none>           1/1
 ```
+
+#### Graceful Backend Draining
+For VCN-native clusters, the controller registers pod IPs directly as OCI Load Balancer backends. When a referenced Pod is terminating and its endpoint is still published, the controller keeps the backend registered with drain enabled. This stops new traffic from selecting the terminating Pod while allowing its existing connections to complete.
+
+The Service used by the Ingress must retain terminating endpoints for this behavior to take effect. This can be configured with `publishNotReadyAddresses`:
+
+```yaml
+apiVersion: v1
+kind: Service
+spec:
+  publishNotReadyAddresses: true
+```
+
+`publishNotReadyAddresses` also makes Kubernetes publish unready endpoints. Consider using a dedicated Ingress-facing Service so this behavior does not affect other Service consumers. Configure the Pod's `preStop` hook and `terminationGracePeriodSeconds` with enough time for controller and load balancer reconciliation followed by application graceful shutdown.
 
 #### HTTPS/TLS Support
 We can configure HTTPS-enabled ingress routes using Kubernetes TLS secrets, OCI certificate OCIDs, or both.

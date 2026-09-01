@@ -52,6 +52,16 @@ func TestGenerateBackendSetName(t *testing.T) {
 	Expect(len(bsNameLong) < 32).Should(Equal(true))
 }
 
+func TestNewBackendSetsDrainState(t *testing.T) {
+	RegisterTestingT(t)
+
+	backend := NewBackend("10.0.0.3", 8080, true)
+
+	Expect(*backend.IpAddress).To(Equal("10.0.0.3"))
+	Expect(*backend.Port).To(Equal(8080))
+	Expect(*backend.Drain).To(BeTrue())
+}
+
 func TestGetIngressClassCompartmentId(t *testing.T) {
 	RegisterTestingT(t)
 
