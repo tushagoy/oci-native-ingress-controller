@@ -251,38 +251,52 @@ func TestLoadBalancerClient_UpdateBackends(t *testing.T) {
 
 }
 
-func TestLoadBalancerClient_UpdateBackendsWhenDrainStateChanges(t *testing.T) {
-	RegisterTestingT(t)
-	loadBalancerClient := setupLBClient()
-	capturedUpdateBackendSetRequest = nil
-
-	backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
-	backends := []ociloadbalancer.BackendDetails{
-		util.NewBackend("127.89.90.90", 80, true),
+func TestLoadBalancerClient_UpdateBackendsDrainTransitions(t *testing.T) {
+	testCases := []struct {
+		name          string
+		actualDrain   *bool
+		desiredDrain  bool
+		expectUpdate  bool
+		expectedDrain bool
+	}{
+		{name: "false to true", actualDrain: common.Bool(false), desiredDrain: true, expectUpdate: true, expectedDrain: true},
+		{name: "true to false", actualDrain: common.Bool(true), desiredDrain: false, expectUpdate: true, expectedDrain: false},
+		{name: "false remains false", actualDrain: common.Bool(false), desiredDrain: false},
+		{name: "true remains true", actualDrain: common.Bool(true), desiredDrain: true},
+		{name: "omitted normalizes to false", actualDrain: nil, desiredDrain: false},
 	}
 
-	err := loadBalancerClient.UpdateBackends(context.TODO(), "id", backendSetName, backends)
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			RegisterTestingT(t)
+			capturedUpdateBackendSetRequest = nil
+			capturedUpdateBackendRequests = nil
+			mockLoadBalancerResponseMutator = func(res *ociloadbalancer.GetLoadBalancerResponse) {
+				backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
+				backendSet := res.BackendSets[backendSetName]
+				backendSet.Backends[0].Drain = testCase.actualDrain
+				res.BackendSets[backendSetName] = backendSet
+			}
+			defer func() { mockLoadBalancerResponseMutator = nil }()
 
-	Expect(err).To(BeNil())
-	Expect(capturedUpdateBackendSetRequest).ToNot(BeNil())
-	Expect(capturedUpdateBackendSetRequest.Backends).To(HaveLen(1))
-	Expect(*capturedUpdateBackendSetRequest.Backends[0].Drain).To(BeTrue())
-}
+			loadBalancerClient := setupLBClient()
+			backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
+			backends := []ociloadbalancer.BackendDetails{
+				util.NewBackend("127.89.90.90", 80, testCase.desiredDrain),
+			}
 
-func TestLoadBalancerClient_UpdateBackendsSkipsMatchingDrainState(t *testing.T) {
-	RegisterTestingT(t)
-	loadBalancerClient := setupLBClient()
-	capturedUpdateBackendSetRequest = nil
+			err := loadBalancerClient.UpdateBackends(context.TODO(), "id", backendSetName, backends)
 
-	backendSetName := util.GenerateBackendSetName("default", "testecho1", 80)
-	backends := []ociloadbalancer.BackendDetails{
-		util.NewBackend("127.89.90.90", 80, false),
+			Expect(err).NotTo(HaveOccurred())
+			Expect(capturedUpdateBackendSetRequest).To(BeNil())
+			if testCase.expectUpdate {
+				Expect(capturedUpdateBackendRequests).To(HaveLen(1))
+				Expect(*capturedUpdateBackendRequests[0].Drain).To(Equal(testCase.expectedDrain))
+			} else {
+				Expect(capturedUpdateBackendRequests).To(BeEmpty())
+			}
+		})
 	}
-
-	err := loadBalancerClient.UpdateBackends(context.TODO(), "id", backendSetName, backends)
-
-	Expect(err).To(BeNil())
-	Expect(capturedUpdateBackendSetRequest).To(BeNil())
 }
 
 func TestLoadBalancerClient_UpdateBackends_PreservesBackendSetTLSPolicy(t *testing.T) {
@@ -999,6 +1013,7 @@ func GetLoadBalancerClient() client.LoadBalancerInterface {
 var capturedCreateBackendSetRequest *ociloadbalancer.CreateBackendSetRequest
 var capturedCreateListenerRequest *ociloadbalancer.CreateListenerRequest
 var capturedUpdateBackendSetRequest *ociloadbalancer.UpdateBackendSetRequest
+var capturedUpdateBackendRequests []ociloadbalancer.UpdateBackendRequest
 var capturedUpdateListenerRequest *ociloadbalancer.UpdateListenerRequest
 var capturedUpdateLoadBalancerRequest *ociloadbalancer.UpdateLoadBalancerDetails
 var mockCreateListenerErr error
@@ -1091,6 +1106,15 @@ func (m MockLoadBalancerClient) UpdateBackendSet(ctx context.Context, request oc
 	id := "id"
 	return ociloadbalancer.UpdateBackendSetResponse{
 		RawResponse:      nil,
+		OpcWorkRequestId: &id,
+		OpcRequestId:     &id,
+	}, nil
+}
+
+func (m MockLoadBalancerClient) UpdateBackend(ctx context.Context, request ociloadbalancer.UpdateBackendRequest) (ociloadbalancer.UpdateBackendResponse, error) {
+	capturedUpdateBackendRequests = append(capturedUpdateBackendRequests, request)
+	id := "id"
+	return ociloadbalancer.UpdateBackendResponse{
 		OpcWorkRequestId: &id,
 		OpcRequestId:     &id,
 	}, nil
