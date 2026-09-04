@@ -171,7 +171,7 @@ func TestNoDefaultBackends(t *testing.T) {
 	Expect(len(backends)).Should(Equal(0))
 }
 
-func TestGetBackendDetailsDrainsTerminatingPods(t *testing.T) {
+func TestGetBackendDetailsRequiresServiceOptInForTerminatingPods(t *testing.T) {
 	RegisterTestingT(t)
 
 	deletionTimestamp := metav1.Now()
@@ -181,10 +181,12 @@ func TestGetBackendDetailsDrainsTerminatingPods(t *testing.T) {
 	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name:      "ready-pod",
 		Namespace: namespace,
+		UID:       "ready-uid",
 	}})).To(Succeed())
 	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name:              "terminating-pod",
 		Namespace:         namespace,
+		UID:               "terminating-uid",
 		DeletionTimestamp: &deletionTimestamp,
 	}})).To(Succeed())
 
@@ -195,6 +197,7 @@ func TestGetBackendDetailsDrainsTerminatingPods(t *testing.T) {
 			TargetRef: &corev1.ObjectReference{
 				Kind: "Pod",
 				Name: "ready-pod",
+				UID:  "ready-uid",
 			},
 		},
 		{
@@ -202,19 +205,27 @@ func TestGetBackendDetailsDrainsTerminatingPods(t *testing.T) {
 			TargetRef: &corev1.ObjectReference{
 				Kind: "Pod",
 				Name: "terminating-pod",
+				UID:  "terminating-uid",
 			},
 		},
 	}
 
-	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080)
+	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080, true)
 
 	Expect(err).NotTo(HaveOccurred())
 	Expect(backends).To(HaveLen(2))
 	Expect(*backends[0].Drain).To(BeFalse())
 	Expect(*backends[1].Drain).To(BeTrue())
+
+	// Disabled Services preserve the legacy backend shape without consulting Pods.
+	backends, err = (&Controller{}).getBackendDetails(namespace, endpointAddresses, 8080, false)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(backends).To(HaveLen(2))
+	Expect(*backends[0].Drain).To(BeFalse())
+	Expect(*backends[1].Drain).To(BeFalse())
 }
 
-func TestGetBackendDetailsDrainsStaleAddressesAndContinues(t *testing.T) {
+func TestGetBackendDetailsLeavesStaleAddressesUndrainedAndContinues(t *testing.T) {
 	RegisterTestingT(t)
 	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
@@ -228,41 +239,70 @@ func TestGetBackendDetailsDrainsStaleAddressesAndContinues(t *testing.T) {
 		{IP: "10.0.0.2", TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: namespace, Name: "missing-pod", UID: "missing-uid"}},
 	}
 
-	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080)
+	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080, true)
 
 	Expect(err).NotTo(HaveOccurred())
 	Expect(backends).To(HaveLen(2))
 	Expect(*backends[0].Drain).To(BeFalse())
-	Expect(*backends[1].Drain).To(BeTrue())
+	Expect(*backends[1].Drain).To(BeFalse())
 }
 
 func TestGetBackendDetailsRequiresMatchingPodIdentity(t *testing.T) {
 	RegisterTestingT(t)
+	deletionTimestamp := metav1.Now()
 	podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
 	Expect(podIndexer.Add(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-		Name:      "recreated-pod",
-		Namespace: "endpoint-namespace",
-		UID:       "new-uid",
+		Name:              "recreated-pod",
+		Namespace:         "endpoint-namespace",
+		UID:               "new-uid",
+		DeletionTimestamp: &deletionTimestamp,
 	}})).To(Succeed())
 	c := &Controller{podLister: corelisters.NewPodLister(podIndexer)}
-	endpointAddresses := []corev1.EndpointAddress{{
-		IP: "10.0.0.3",
-		TargetRef: &corev1.ObjectReference{
-			Kind:      "Pod",
-			Namespace: "endpoint-namespace",
-			Name:      "recreated-pod",
-			UID:       "old-uid",
+	endpointAddresses := []corev1.EndpointAddress{
+		{
+			IP: "10.0.0.3",
+			TargetRef: &corev1.ObjectReference{
+				Kind:      "Pod",
+				Namespace: "endpoint-namespace",
+				Name:      "recreated-pod",
+				UID:       "old-uid",
+			},
 		},
-	}}
+		{
+			IP: "10.0.0.4",
+			TargetRef: &corev1.ObjectReference{
+				Kind:      "Pod",
+				Namespace: "endpoint-namespace",
+				Name:      "recreated-pod",
+			},
+		},
+	}
 
-	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080)
+	backends, err := c.getBackendDetails(namespace, endpointAddresses, 8080, true)
 
 	Expect(err).NotTo(HaveOccurred())
-	Expect(backends).To(HaveLen(1))
-	Expect(*backends[0].Drain).To(BeTrue())
+	Expect(backends).To(HaveLen(2))
+	Expect(*backends[0].Drain).To(BeFalse())
+	Expect(*backends[1].Drain).To(BeFalse())
 }
 
 func TestPodTerminationEnqueuesAffectedIngressClass(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := inits(ctx, util.GetIngressClassList(), backendPath)
+	setBackendDrainingAnnotation(c, "true", "testecho1")
+	oldPod := util.GetPodResourceList("testpod", "echoserver").Items[0]
+	newPod := oldPod.DeepCopy()
+	deletionTimestamp := metav1.Now()
+	newPod.DeletionTimestamp = &deletionTimestamp
+
+	c.podUpdate(&oldPod, newPod)
+
+	Expect(c.queue.Len()).To(Equal(1))
+}
+
+func TestPodTerminationDoesNotEnqueueServiceWithoutOptIn(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -274,7 +314,7 @@ func TestPodTerminationEnqueuesAffectedIngressClass(t *testing.T) {
 
 	c.podUpdate(&oldPod, newPod)
 
-	Expect(c.queue.Len()).To(Equal(1))
+	Expect(c.queue.Len()).To(BeZero())
 }
 
 func TestEnsureBackendsPropagatesDefaultBackendErrors(t *testing.T) {
@@ -321,6 +361,7 @@ func TestTerminationLifecycleReconcilesPathAndDefaultBackends(t *testing.T) {
 	ingressClassList := util.GetIngressClassListWithLBSet("id")
 	lifecycleLB := newLifecycleLoadBalancerClient()
 	c, endpointInformer, podInformer := initsWithLoadBalancerClient(ctx, ingressClassList, backendPathWithDefaultBackend, lifecycleLB)
+	setBackendDrainingAnnotation(c, "true", "testecho1", "host-es")
 	ingressClass := &ingressClassList.Items[0]
 
 	// Healthy Pod and unchanged Endpoint membership require no OCI mutation.
@@ -369,7 +410,49 @@ func TestTerminationLifecycleReconcilesPathAndDefaultBackends(t *testing.T) {
 	}
 }
 
-func TestStaleEndpointDrainsThenIsRemovedAfterCacheCatchesUp(t *testing.T) {
+func TestTerminatingPodWithoutServiceOptInRemainsUndrained(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	lifecycleLB := newLifecycleLoadBalancerClient()
+	c, _, podInformer := initsWithLoadBalancerClient(ctx, ingressClassList, backendPathWithDefaultBackend, lifecycleLB)
+
+	pod, err := podInformer.Lister().Pods(namespace).Get("testpod")
+	Expect(err).NotTo(HaveOccurred())
+	terminatingPod := pod.DeepCopy()
+	deletionTimestamp := metav1.Now()
+	terminatingPod.DeletionTimestamp = &deletionTimestamp
+	Expect(podInformer.Informer().GetIndexer().Update(terminatingPod)).To(Succeed())
+
+	Expect(c.ensureBackends(getContextWithClient(c, ctx), &ingressClassList.Items[0], "id")).To(Succeed())
+	Expect(lifecycleLB.updateBackendRequests).To(BeEmpty())
+	Expect(lifecycleLB.updateBackendSetRequests).To(BeEmpty())
+}
+
+func TestDisablingServiceOptInUndrainsPathAndDefaultBackends(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ingressClassList := util.GetIngressClassListWithLBSet("id")
+	lifecycleLB := newLifecycleLoadBalancerClient()
+	for _, backendSetName := range []string{util.GenerateBackendSetName(namespace, "testecho1", 80), util.DefaultBackendSetName} {
+		backendSet := lifecycleLB.response.BackendSets[backendSetName]
+		backendSet.Backends[0].Drain = common.Bool(true)
+		lifecycleLB.response.BackendSets[backendSetName] = backendSet
+	}
+	c, _, _ := initsWithLoadBalancerClient(ctx, ingressClassList, backendPathWithDefaultBackend, lifecycleLB)
+	setBackendDrainingAnnotation(c, "false", "testecho1", "host-es")
+
+	Expect(c.ensureBackends(getContextWithClient(c, ctx), &ingressClassList.Items[0], "id")).To(Succeed())
+	Expect(lifecycleLB.updateBackendRequests).To(HaveLen(2))
+	for _, request := range lifecycleLB.updateBackendRequests {
+		Expect(*request.Drain).To(BeFalse())
+	}
+	Expect(lifecycleLB.updateBackendSetRequests).To(BeEmpty())
+}
+
+func TestStaleEndpointRemainsUndrainedThenIsRemovedAfterCacheCatchesUp(t *testing.T) {
 	RegisterTestingT(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -379,17 +462,18 @@ func TestStaleEndpointDrainsThenIsRemovedAfterCacheCatchesUp(t *testing.T) {
 	defaultBackendSet.Backends = nil
 	lifecycleLB.response.BackendSets[util.DefaultBackendSetName] = defaultBackendSet
 	c, endpointInformer, podInformer := initsWithLoadBalancerClient(ctx, ingressClassList, backendPath, lifecycleLB)
+	setBackendDrainingAnnotation(c, "true", "testecho1")
 
 	pod, err := podInformer.Lister().Pods(namespace).Get("testpod")
 	Expect(err).NotTo(HaveOccurred())
 	Expect(podInformer.Informer().GetIndexer().Delete(pod)).To(Succeed())
 
 	// The periodic fallback sees the stale Endpoint after the Pod has already
-	// disappeared. It drains that address and continues instead of failing the set.
+	// disappeared. It preserves the undrained backend because the exact terminating
+	// Pod cannot be verified, and continues instead of failing the set.
 	c.runPusher()
 	Expect(c.processNextItem()).To(BeTrue())
-	Expect(lifecycleLB.updateBackendRequests).To(HaveLen(1))
-	Expect(*lifecycleLB.updateBackendRequests[0].Drain).To(BeTrue())
+	Expect(lifecycleLB.updateBackendRequests).To(BeEmpty())
 
 	oldEndpoints, err := endpointInformer.Lister().Endpoints(namespace).Get("testecho1")
 	Expect(err).NotTo(HaveOccurred())
@@ -502,6 +586,21 @@ func initsWithLoadBalancerClient(ctx context.Context, ingressClassList *networki
 	metricsCollector := metric.NewIngressCollector("oci.oraclecloud.com/native-ingress-controller", prometheus.NewRegistry())
 	c := NewController("oci.oraclecloud.com/native-ingress-controller", ingressClassInformer, ingressInformer, saInformer, serviceLister, endpointInformer, podInformer, client, metricsCollector, fakeRecorder)
 	return c, endpointInformer, podInformer
+}
+
+func setBackendDrainingAnnotation(c *Controller, value string, serviceNames ...string) {
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, serviceName := range serviceNames {
+		service, err := c.serviceLister.Services(namespace).Get(serviceName)
+		Expect(err).NotTo(HaveOccurred())
+		service = service.DeepCopy()
+		if service.Annotations == nil {
+			service.Annotations = map[string]string{}
+		}
+		service.Annotations[util.ServiceBackendDrainingAnnotation] = value
+		Expect(indexer.Add(service)).To(Succeed())
+	}
+	c.serviceLister = corelisters.NewServiceLister(indexer)
 }
 
 func TestGetIngressesForClass(t *testing.T) {

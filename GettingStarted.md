@@ -463,7 +463,7 @@ testecho-7cdcfff87f-b6xt4                        1/1     Running   0          72
 ```
 
 #### Graceful Backend Draining
-For VCN-native clusters, the controller registers Pod IPs as OCI Load Balancer backends. When a published Endpoint references a Pod with a `deletionTimestamp`, backend reconciliation keeps the existing backend registered and sets `drain=true`. Pod and Endpoint changes enqueue reconciliation immediately; a periodic reconciliation that runs every 10 seconds remains as a fallback.
+For VCN-native clusters, the controller registers Pod IPs as OCI Load Balancer backends. Backend draining is opt-in at the Service level. When a Service has `oci-native-ingress.oraclecloud.com/backend-draining: "true"` and a published Endpoint references the exact Pod with a `deletionTimestamp`, backend reconciliation keeps the existing backend registered and sets `drain=true`. Pod and Endpoint changes enqueue reconciliation immediately; a periodic reconciliation that runs every 10 seconds remains as a fallback. Services without the annotation, or with any value other than a valid boolean `true`, retain the existing `drain=false` behavior. Removing or disabling the annotation returns any still-published backends to `drain=false` on the next reconciliation.
 
 OCI drain mode stops new TCP connections and new non-sticky HTTP requests from selecting the backend. Persistence-enabled sessions can still be routed to it. The load balancer does not keep the Pod alive, so existing work can finish only while the application remains running. The application must handle `SIGTERM`, stop accepting new work, and finish or cancel in-flight work within `terminationGracePeriodSeconds`. Bound the lifetime of WebSocket, streaming, and other long-lived connections to this shutdown budget, or expect Kubernetes to terminate them when the grace period expires.
 
@@ -478,6 +478,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: my-app-ingress
+  annotations:
+    oci-native-ingress.oraclecloud.com/backend-draining: "true"
 spec:
   # Keep terminating Pod endpoints visible long enough for NIC to enable drain.
   # Do not reuse this Service for non-Ingress consumers.

@@ -134,23 +134,23 @@ func (c *Controller) podUpdate(oldObj, newObj interface{}) {
 		return
 	}
 
-	matchedEndpoint := false
 	endpoints, err := c.endpointLister.Endpoints(newPod.Namespace).List(labels.Everything())
 	if err == nil {
 		for _, endpoint := range endpoints {
-			if endpointReferencesPod(endpoint, newPod) {
-				matchedEndpoint = true
+			if !endpointReferencesPod(endpoint, newPod) {
+				continue
+			}
+			service, serviceErr := c.serviceLister.Services(endpoint.Namespace).Get(endpoint.Name)
+			if serviceErr != nil {
+				klog.ErrorS(serviceErr, "Unable to get service for terminating pod endpoint", "pod", klog.KObj(newPod), "service", klog.KRef(endpoint.Namespace, endpoint.Name))
+				continue
+			}
+			if util.GetServiceBackendDrainingEnabled(service) {
 				c.enqueueIngressClassesForService(endpoint.Namespace, endpoint.Name)
 			}
 		}
 	} else {
 		klog.ErrorS(err, "Unable to list endpoints for terminating pod", "pod", klog.KObj(newPod))
-	}
-
-	if !matchedEndpoint {
-		// Informer caches can be briefly out of sync. Enqueue every managed class so
-		// a Pod termination is never missed solely because its Endpoint was not visible.
-		c.enqueueAllIngressClasses()
 	}
 }
 
@@ -159,11 +159,11 @@ func endpointReferencesPod(endpoints *corev1.Endpoints, pod *corev1.Pod) bool {
 		addresses := append(append([]corev1.EndpointAddress{}, subset.Addresses...), subset.NotReadyAddresses...)
 		for _, address := range addresses {
 			if address.TargetRef == nil || address.TargetRef.Name != pod.Name ||
-				(address.TargetRef.Kind != "" && address.TargetRef.Kind != "Pod") ||
+				address.TargetRef.Kind != "Pod" ||
 				(address.TargetRef.Namespace != "" && address.TargetRef.Namespace != pod.Namespace) {
 				continue
 			}
-			if address.TargetRef.UID == "" || pod.UID == "" || address.TargetRef.UID == pod.UID {
+			if address.TargetRef.UID != "" && pod.UID != "" && address.TargetRef.UID == pod.UID {
 				return true
 			}
 		}
@@ -353,7 +353,7 @@ func (c *Controller) ensureBackendsForIngress(ctx context.Context, ingress *netw
 				return fmt.Errorf("unable to fetch endpoints for %s/%s/%d: %w", ingress.Namespace, svcName, targetPort, err)
 			}
 
-			backends, err := c.getBackendDetails(ingress.Namespace, epAddrs, targetPort)
+			backends, err := c.getBackendDetails(ingress.Namespace, epAddrs, targetPort, util.GetServiceBackendDrainingEnabled(svc))
 			if err != nil {
 				return err
 			}
@@ -457,28 +457,29 @@ func (c *Controller) getDefaultBackends(ingresses []*networkingv1.Ingress) ([]oc
 		return nil, fmt.Errorf("unable to fetch endpoints for %s/%s/%d: %w", namespace, svcName, targetPort, err)
 	}
 
-	backends, err = c.getBackendDetails(namespace, epAdrress, targetPort)
+	backends, err = c.getBackendDetails(namespace, epAdrress, targetPort, util.GetServiceBackendDrainingEnabled(svc))
 	if err != nil {
 		return nil, err
 	}
 	return backends, err
 }
 
-func (c *Controller) getBackendDetails(namespace string, endpointAddresses []corev1.EndpointAddress, targetPort int32) ([]ociloadbalancer.BackendDetails, error) {
+func (c *Controller) getBackendDetails(namespace string, endpointAddresses []corev1.EndpointAddress, targetPort int32, backendDrainingEnabled bool) ([]ociloadbalancer.BackendDetails, error) {
 	backends := make([]ociloadbalancer.BackendDetails, 0, len(endpointAddresses))
 	for _, endpointAddress := range endpointAddresses {
+		if !backendDrainingEnabled {
+			backends = append(backends, util.NewBackend(endpointAddress.IP, targetPort, false))
+			continue
+		}
+
 		pod, resolved, err := c.resolveEndpointPod(namespace, endpointAddress)
 		if err != nil {
 			return nil, err
 		}
 
-		// If the Endpoint cannot be matched to the exact Pod object, retain the
-		// address but fail closed by draining it. This avoids aborting the entire
-		// backend set or accidentally borrowing state from a replacement Pod.
-		drain := true
-		if resolved {
-			drain = pod.DeletionTimestamp != nil
-		}
+		// Backend draining is opt-in and requires an exact Pod identity match.
+		// Unresolved references retain the existing undrained behavior.
+		drain := resolved && pod.DeletionTimestamp != nil
 		backends = append(backends, util.NewBackend(endpointAddress.IP, targetPort, drain))
 	}
 	return backends, nil
@@ -487,11 +488,15 @@ func (c *Controller) getBackendDetails(namespace string, endpointAddresses []cor
 func (c *Controller) resolveEndpointPod(serviceNamespace string, endpointAddress corev1.EndpointAddress) (*corev1.Pod, bool, error) {
 	targetRef := endpointAddress.TargetRef
 	if targetRef == nil || targetRef.Name == "" {
-		klog.Warningf("draining backend %s because endpoint in namespace %s has no Pod reference", endpointAddress.IP, serviceNamespace)
+		klog.Warningf("leaving backend %s undrained because endpoint in namespace %s has no Pod reference", endpointAddress.IP, serviceNamespace)
 		return nil, false, nil
 	}
-	if targetRef.Kind != "" && targetRef.Kind != "Pod" {
-		klog.Warningf("draining backend %s because endpoint target %s/%s is not a Pod", endpointAddress.IP, targetRef.Kind, targetRef.Name)
+	if targetRef.Kind != "Pod" {
+		klog.Warningf("leaving backend %s undrained because endpoint target %s/%s is not a Pod", endpointAddress.IP, targetRef.Kind, targetRef.Name)
+		return nil, false, nil
+	}
+	if targetRef.UID == "" {
+		klog.Warningf("leaving backend %s undrained because endpoint Pod %s has no UID", endpointAddress.IP, targetRef.Name)
 		return nil, false, nil
 	}
 
@@ -501,14 +506,14 @@ func (c *Controller) resolveEndpointPod(serviceNamespace string, endpointAddress
 	}
 	pod, err := c.podLister.Pods(podNamespace).Get(targetRef.Name)
 	if apierrors.IsNotFound(err) {
-		klog.Warningf("draining backend %s because endpoint Pod %s/%s is not in the informer cache", endpointAddress.IP, podNamespace, targetRef.Name)
+		klog.Warningf("leaving backend %s undrained because endpoint Pod %s/%s is not in the informer cache", endpointAddress.IP, podNamespace, targetRef.Name)
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to fetch pod %s/%s: %w", podNamespace, targetRef.Name, err)
 	}
-	if targetRef.UID != "" && pod.UID != targetRef.UID {
-		klog.Warningf("draining backend %s because endpoint Pod %s/%s references UID %s but the informer contains UID %s", endpointAddress.IP, podNamespace, targetRef.Name, targetRef.UID, pod.UID)
+	if pod.UID != targetRef.UID {
+		klog.Warningf("leaving backend %s undrained because endpoint Pod %s/%s references UID %s but the informer contains UID %s", endpointAddress.IP, podNamespace, targetRef.Name, targetRef.UID, pod.UID)
 		return nil, false, nil
 	}
 
